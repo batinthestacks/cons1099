@@ -61,7 +61,6 @@ class DualLogger:
         self.color_log.close()
         self.plain_log.close()
 
-
 def parse_val_and_c(val_str):
     """Parses a string into a float and detects if it has a 'C' (Corrected) flag."""
     if not val_str or val_str == '...': 
@@ -157,8 +156,10 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
         re.IGNORECASE
     )
     
-    supp_sec_pattern = re.compile(r'^([A-Z0-9\s\.\-\']+?)\s*/\s*([A-Z0-9]{9})(?:\s*/.*)?$')
-    treasury_pattern = re.compile(r'U\.S\.\s*Treasury\s+([\d\.]+)')
+    # Updated to allow 7 to 9 character CUSIPs and swallow the trailing ticker symbol
+    supp_sec_pattern = re.compile(r'^(.*?)\s*/\s*([A-Z0-9]{7,9})(?:\s*/.*)?$')
+    fed_total_pattern = re.compile(r'Fed\s*Source\s*Total[\s:]*([\d\.]+)', re.IGNORECASE)
+    agency_pattern = re.compile(r'(?:U\.S\.\s*Treasury|Fed\s*Farm\s*Credit|TN\s*Valley\s*Auth|Fed\s*Home\s*Loan|Student\s*Loan|Other\s*Dir\.?\s*Fed\.?)\s+([\d\.]+)', re.IGNORECASE)
     ny_pattern = re.compile(r'New York\s+([\d\.]+)')
 
     current_global_box = None
@@ -403,11 +404,29 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
                     elif in_supp_section:
                         sec_match = supp_sec_pattern.search(line)
                         if sec_match:
-                            supplemental_extracted.append({'name': sec_match.group(1).strip(), 'cusip': sec_match.group(2).strip().upper(), 'fed_pct': None, 'ny_pct': None})
+                            supplemental_extracted.append({
+                                'name': sec_match.group(1).strip(), 
+                                'cusip': sec_match.group(2).strip().upper(), 
+                                'fed_pct': None, 
+                                'ny_pct': None,
+                                'has_fed_total': False,
+                                'agency_sum': 0.0,
+                                'has_agency': False
+                            })
                         elif supplemental_extracted:
-                            t_m, ny_m = treasury_pattern.search(line), ny_pattern.search(line)
-                            if t_m: supplemental_extracted[-1]['fed_pct'] = clean_num(t_m.group(1)) / 100.0
-                            if ny_m: supplemental_extracted[-1]['ny_pct'] = clean_num(ny_m.group(1)) / 100.0
+                            fed_tot_m = fed_total_pattern.search(line)
+                            ny_m = ny_pattern.search(line)
+                            
+                            if fed_tot_m:
+                                supplemental_extracted[-1]['fed_pct'] = clean_num(fed_tot_m.group(1)) / 100.0
+                                supplemental_extracted[-1]['has_fed_total'] = True
+                            elif not supplemental_extracted[-1].get('has_fed_total'):
+                                for agency_match in agency_pattern.finditer(line):
+                                    supplemental_extracted[-1]['agency_sum'] += clean_num(agency_match.group(1)) / 100.0
+                                    supplemental_extracted[-1]['has_agency'] = True
+                                    
+                            if ny_m: 
+                                supplemental_extracted[-1]['ny_pct'] = clean_num(ny_m.group(1)) / 100.0
 
             if current_sec_id and current_page_prefixes and not current_page_has_cont:
                 working_div_data[current_sec_id]['name_parts'].extend(current_page_prefixes)
@@ -430,8 +449,16 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
     for supp in supplemental_extracted:
         matched_sec = next((k for k, v in dividends_data.items() if v['cusip'] == supp['cusip'] or k.upper() == supp['name'].upper()), None)
         if matched_sec:
-            if supp['fed_pct'] is not None: dividends_data[matched_sec]['supplemental']['fed_pct'] = supp['fed_pct']
-            if supp['ny_pct'] is not None: dividends_data[matched_sec]['supplemental']['ny_pct'] = supp['ny_pct']
+            final_fed_pct = None
+            if supp.get('has_fed_total'):
+                final_fed_pct = supp.get('fed_pct')
+            elif supp.get('has_agency'):
+                final_fed_pct = supp.get('agency_sum')
+                
+            if final_fed_pct is not None:
+                dividends_data[matched_sec]['supplemental']['fed_pct'] = final_fed_pct
+            if supp['ny_pct'] is not None: 
+                dividends_data[matched_sec]['supplemental']['ny_pct'] = supp['ny_pct']
 
     csv_needs_update = False
     if fed_csv_path:
