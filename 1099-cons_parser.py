@@ -205,6 +205,11 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
                         start_desc = matches[i-1].end() if i > 0 else 0
                         between_text = page_text[start_desc:match.start()]
                         
+                        # Check the gap right before the date column for a floating 'C' (e.g. from "Total of X transactions")
+                        has_row_c = bool(re.search(r'(?:\s+C\s*$|^\s*C\s*$)', between_text, flags=re.MULTILINE | re.IGNORECASE))
+                        if data.get('addl_info') and re.search(r'(?:\s+C\s*$|^\s*C\s*$)', data['addl_info'], flags=re.IGNORECASE):
+                            has_row_c = True
+                        
                         anchors = [r'Additional\s*information', r'also\s*not\s*reported\s*\(Z\)', r'alsonotreported\(Z\)', r'Original\s*basis:\s*\$[\d,]+\.\d{2}']
                         for anchor in anchors: between_text = re.split(anchor, between_text, flags=re.IGNORECASE)[-1]
                             
@@ -233,10 +238,19 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
                         qty_val, qty_c = parse_val_and_c(data['qty'])
                         qty_str = f"{qty_val}".rstrip('0').rstrip('.') if '.' in f"{qty_val}" else f"{qty_val}"
                         
+                        p_val, p_c = parse_val_and_c(data['proceeds'])
+                        cb_val, cb_c = parse_val_and_c(data['basis'])
+                        adj_val, adj_c = parse_val_and_c(data['adj']) if data['adj'] else (0.0, False)
+                        gl_val, gl_c = parse_val_and_c(data['gl'])
+                        
+                        qty_c = qty_c or has_row_c
+                        p_c = p_c or has_row_c
+                        cb_c = cb_c or has_row_c
+                        adj_c = adj_c or has_row_c
+                        gl_c = gl_c or has_row_c
+                        
                         base_desc = re.sub(r'\s*/\s*Symbol:?\s*$', '', current_1099b_sec, flags=re.IGNORECASE).strip()
                         formatted_desc = f"{qty_str} {base_desc}"
-                        
-                        adj_val, adj_c = parse_val_and_c(data['adj']) if data['adj'] else (0.0, False)
                         
                         tx = {
                             'box': box, 
@@ -245,10 +259,10 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
                             'date_sold': data['dsold'], 
                             'date_acquired': data['dacq'],
                             'quantity': {'val': qty_val, 'c': qty_c},
-                            'proceeds': {'val': parse_val_and_c(data['proceeds'])[0], 'c': parse_val_and_c(data['proceeds'])[1]},
-                            'cost_basis': {'val': parse_val_and_c(data['basis'])[0], 'c': parse_val_and_c(data['basis'])[1]},
+                            'proceeds': {'val': p_val, 'c': p_c},
+                            'cost_basis': {'val': cb_val, 'c': cb_c},
                             'adjustments': {'val': adj_val, 'c': adj_c},
-                            'gain_loss': {'val': parse_val_and_c(data['gl'])[0], 'c': parse_val_and_c(data['gl'])[1]}
+                            'gain_loss': {'val': gl_val, 'c': gl_c}
                         }
                         transactions.append(tx)
                 if box_headers: current_global_box = box_headers[-1]['box']
@@ -389,14 +403,12 @@ def compare_statements(curr_tx, curr_info, curr_divs, orig_tx, orig_info, orig_d
 
     print(f"\n{COLOR_CYAN}--- Running Original vs Current Comparison ---{COLOR_RESET}")
     
-    # 1. Compare Info 1099
     for key in ['1a', '1b', '2a', '2b', '3', '5', '12']:
         log_diff(f"Summary Box {key}", orig_info[key]['val'], curr_info[key]['val'], curr_info[key]['c'])
         
     for key in ['Total Dividends & distributions', 'Total Tax-exempt dividends']:
         log_diff(f"Grand Total '{key}'", orig_info['grand_totals'][key]['val'], curr_info['grand_totals'][key]['val'], curr_info['grand_totals'][key]['c'])
 
-    # 2. Compare Dividends
     for sec, c_data in curr_divs.items():
         o_data = orig_divs.get(sec)
         if not o_data:
@@ -411,11 +423,9 @@ def compare_statements(curr_tx, curr_info, curr_divs, orig_tx, orig_info, orig_d
             o_val = o_data['totals'].get(t_type, {'val': 0.0})['val']
             log_diff(f"Div Total [{sec}] '{t_type}'", o_val, c_tot['val'], c_tot['c'])
             
-        # POOL MATCHING LOGIC FOR DIVIDENDS
         unmatched_orig = list(o_data['transactions'])
         unmatched_curr = []
         
-        # Pass 1: Exact matches (Date, Type, AND Amount)
         for c_t in c_data['transactions']:
             exact_match = next((t for t in unmatched_orig if t['date'] == c_t['date'] and t['type'] == c_t['type'] and t['amount']['val'] == c_t['amount']['val']), None)
             if exact_match:
@@ -423,7 +433,6 @@ def compare_statements(curr_tx, curr_info, curr_divs, orig_tx, orig_info, orig_d
             else:
                 unmatched_curr.append(c_t)
                 
-        # Pass 2: Match by identity (Date and Type) for corrections
         for c_t in unmatched_curr:
             identity_match = next((t for t in unmatched_orig if t['date'] == c_t['date'] and t['type'] == c_t['type']), None)
             if identity_match:
@@ -432,11 +441,9 @@ def compare_statements(curr_tx, curr_info, curr_divs, orig_tx, orig_info, orig_d
             else:
                 discrepancies.append(f"[NEW] Div Tx [{sec}] added: {c_t['date']} {c_t['type']} {c_t['amount']['val']:.2f}")
 
-    # 3. Compare 1099-B Transactions
     unmatched_orig_tx = list(orig_tx)
     unmatched_curr_tx = []
     
-    # Pass 1: Exact Matches (Box, Desc, Date, Qty, Proceeds, CB)
     for c_t in curr_tx:
         exact = next((t for t in unmatched_orig_tx if 
             t['box'] == c_t['box'] and 
@@ -451,7 +458,6 @@ def compare_statements(curr_tx, curr_info, curr_divs, orig_tx, orig_info, orig_d
         else:
             unmatched_curr_tx.append(c_t)
             
-    # Pass 2: Match by identity (Box, Desc, Date, Qty) for corrections
     for c_t in unmatched_curr_tx:
         identity_match = next((t for t in unmatched_orig_tx if 
             t['box'] == c_t['box'] and 
