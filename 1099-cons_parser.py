@@ -205,9 +205,8 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
                         start_desc = matches[i-1].end() if i > 0 else 0
                         between_text = page_text[start_desc:match.start()]
                         
-                        # Check the gap right before the date column for a floating 'C' (e.g. from "Total of X transactions")
-                        has_row_c = bool(re.search(r'(?:\s+C\s*$|^\s*C\s*$)', between_text, flags=re.MULTILINE | re.IGNORECASE))
-                        if data.get('addl_info') and re.search(r'(?:\s+C\s*$|^\s*C\s*$)', data['addl_info'], flags=re.IGNORECASE):
+                        has_row_c = bool(re.search(r'(?:\s+[cC]\s*$|^\s*[cC]\s*$)', between_text, flags=re.MULTILINE))
+                        if data.get('addl_info') and re.search(r'(?:\s+[cC]\s*$|^\s*[cC]\s*$)', data['addl_info']):
                             has_row_c = True
                         
                         anchors = [r'Additional\s*information', r'also\s*not\s*reported\s*\(Z\)', r'alsonotreported\(Z\)', r'Original\s*basis:\s*\$[\d,]+\.\d{2}']
@@ -317,6 +316,13 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
                         if ld['type'] == 'total' and current_sec_id:
                             t_raw = ld['desc']
                             amt_val, amt_c = parse_val_and_c(ld['amount'])
+                            
+                            desc_junk_match = re.search(r'\s{2,}[\d\s]*[cC]?\s*$', t_raw)
+                            if desc_junk_match:
+                                if 'C' in desc_junk_match.group().upper():
+                                    amt_c = True
+                                t_raw = t_raw[:desc_junk_match.start()].strip()
+                                
                             if 'tax-exempt' in t_raw.lower(): t_type = 'Total Tax-exempt dividends'
                             elif 'foreign' in t_raw.lower(): t_type = 'Total Foreign tax withheld'
                             else: t_type = 'Total Dividends & distributions'
@@ -336,9 +342,17 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
                                 working_div_data[current_sec_id]['totals'][t_type] = {'val': amt_val, 'c': amt_c}
                                 
                         elif ld['type'] == 'transaction' and current_sec_id:
+                            t_desc = ld['desc']
                             amt_val, amt_c = parse_val_and_c(ld['amount'])
+                            
+                            desc_junk_match = re.search(r'\s{2,}[\d\s]*[cC]?\s*$', t_desc)
+                            if desc_junk_match:
+                                if 'C' in desc_junk_match.group().upper():
+                                    amt_c = True
+                                t_desc = t_desc[:desc_junk_match.start()].strip()
+                                
                             working_div_data[current_sec_id]['transactions'].append({
-                                'date': ld['date'], 'amount': {'val': amt_val, 'c': amt_c}, 'type': ld['desc']
+                                'date': ld['date'], 'amount': {'val': amt_val, 'c': amt_c}, 'type': t_desc
                             })
                             
                     elif in_supp_section:
@@ -392,12 +406,22 @@ def compare_statements(curr_tx, curr_info, curr_divs, orig_tx, orig_info, orig_d
     c_res = COLOR_RESET if use_color else ""
     
     discrepancies = []
+    diffs_csv_rows = []
     
-    def log_diff(context, old_val, new_val, is_c):
+    def log_diff(context, old_val, new_val, is_c, change_type="Modified Value"):
         if old_val == new_val: return
         flag_str = "[C-FLAGGED]" if is_c else "[UNMARKED CHANGE]"
         msg = f"{flag_str} {context}: Original: {old_val:.2f} -> Current: {new_val:.2f}"
         discrepancies.append(msg)
+        
+        diffs_csv_rows.append({
+            'C_Flagged': 'Yes' if is_c else 'No',
+            'Change_Type': change_type,
+            'Context': context,
+            'Original_Value': f"{old_val:.2f}",
+            'Current_Value': f"{new_val:.2f}"
+        })
+        
         if not is_c: print(f"{c_red}{msg}{c_res}")
         else: print(f"{c_yellow}{msg}{c_res}")
 
@@ -417,6 +441,11 @@ def compare_statements(curr_tx, curr_info, curr_divs, orig_tx, orig_info, orig_d
         if not o_data:
             msg = f"[NEW] Security added in current statement: {sec}"
             discrepancies.append(msg)
+            diffs_csv_rows.append({
+                'C_Flagged': 'N/A', 'Change_Type': 'Added Security', 'Context': f"Security [{sec}]",
+                'Original_Value': 'None', 'Current_Value': 'Present'
+            })
+            print(f"{c_red}{msg}{c_res}")
             continue
             
         for t_type, c_tot in c_data['totals'].items():
@@ -426,32 +455,98 @@ def compare_statements(curr_tx, curr_info, curr_divs, orig_tx, orig_info, orig_d
         unmatched_orig = list(o_data['transactions'])
         unmatched_curr = []
         
+        # Pass 1: Exact matches (Date, Type, AND Amount)
         for c_t in c_data['transactions']:
-            exact_match = next((t for t in unmatched_orig if t['date'] == c_t['date'] and t['type'] == c_t['type'] and t['amount']['val'] == c_t['amount']['val']), None)
+            exact_match = next((t for t in unmatched_orig if t['date'] == c_t['date'] and t['type'] == c_t['type'] and abs(t['amount']['val'] - c_t['amount']['val']) < 0.001), None)
             if exact_match:
                 unmatched_orig.remove(exact_match)
             else:
                 unmatched_curr.append(c_t)
                 
+        # Pass 2: Recharacterization (Split/Merge) Detection (Match by Date and Total Sum)
+        still_unmatched_curr = []
+        orig_by_date = defaultdict(list)
+        for t in unmatched_orig: orig_by_date[t['date']].append(t)
+        curr_by_date = defaultdict(list)
+        for t in unmatched_curr: curr_by_date[t['date']].append(t)
+        
+        for date, c_txs in curr_by_date.items():
+            if date in orig_by_date:
+                o_txs = orig_by_date[date]
+                o_sum = sum(t['amount']['val'] for t in o_txs)
+                c_sum = sum(t['amount']['val'] for t in c_txs)
+                
+                if abs(o_sum - c_sum) < 0.02:
+                    any_c_flag = any(t['amount']['c'] for t in c_txs)
+                    flag_str = "[C-FLAGGED]" if any_c_flag else "[UNMARKED CHANGE]"
+                    
+                    o_desc = " + ".join([f"{t['type']} (${t['amount']['val']:.2f})" for t in o_txs])
+                    c_desc = " + ".join([f"{t['type']} (${t['amount']['val']:.2f})" for t in c_txs])
+                    
+                    msg = f"{flag_str} Recharacterized Div [{sec}] ({date}): Original: {o_desc} -> Current: {c_desc}"
+                    discrepancies.append(msg)
+                    diffs_csv_rows.append({
+                        'C_Flagged': 'Yes' if any_c_flag else 'No',
+                        'Change_Type': 'Recharacterization',
+                        'Context': f"Div [{sec}] ({date})",
+                        'Original_Value': o_desc,
+                        'Current_Value': c_desc
+                    })
+                    
+                    if not any_c_flag: print(f"{c_red}{msg}{c_res}")
+                    else: print(f"{c_yellow}{msg}{c_res}")
+                    
+                    for t in o_txs: unmatched_orig.remove(t)
+                else:
+                    still_unmatched_curr.extend(c_txs)
+            else:
+                still_unmatched_curr.extend(c_txs)
+                
+        # Pass 3: Match by identity (Date and Type) for corrections where the sum ALSO changed
+        unmatched_curr = still_unmatched_curr
+        still_unmatched_curr = []
+        
         for c_t in unmatched_curr:
             identity_match = next((t for t in unmatched_orig if t['date'] == c_t['date'] and t['type'] == c_t['type']), None)
             if identity_match:
                 unmatched_orig.remove(identity_match)
-                log_diff(f"Div Tx [{sec}] ({c_t['date']} {c_t['type']})", identity_match['amount']['val'], c_t['amount']['val'], c_t['amount']['c'])
+                log_diff(f"Div Tx [{sec}] ({c_t['date']} {c_t['type']})", identity_match['amount']['val'], c_t['amount']['val'], c_t['amount']['c'], "Modified Value")
             else:
-                discrepancies.append(f"[NEW] Div Tx [{sec}] added: {c_t['date']} {c_t['type']} {c_t['amount']['val']:.2f}")
+                still_unmatched_curr.append(c_t)
+                
+        # Pass 4: Orphans (New or Removed)
+        for c_t in still_unmatched_curr:
+            msg = f"[NEW] Div Tx [{sec}] added: {c_t['date']} {c_t['type']} ${c_t['amount']['val']:.2f}"
+            discrepancies.append(msg)
+            diffs_csv_rows.append({
+                'C_Flagged': 'Yes' if c_t['amount']['c'] else 'No',
+                'Change_Type': 'Added Transaction',
+                'Context': f"Div [{sec}] ({c_t['date']} {c_t['type']})",
+                'Original_Value': 'None',
+                'Current_Value': f"${c_t['amount']['val']:.2f}"
+            })
+            print(f"{c_red}{msg}{c_res}")
+            
+        for o_t in unmatched_orig:
+            msg = f"[REMOVED] Div Tx [{sec}] removed: {o_t['date']} {o_t['type']} ${o_t['amount']['val']:.2f}"
+            discrepancies.append(msg)
+            diffs_csv_rows.append({
+                'C_Flagged': 'N/A',
+                'Change_Type': 'Removed Transaction',
+                'Context': f"Div [{sec}] ({o_t['date']} {o_t['type']})",
+                'Original_Value': f"${o_t['amount']['val']:.2f}",
+                'Current_Value': 'None'
+            })
+            print(f"{c_red}{msg}{c_res}")
 
     unmatched_orig_tx = list(orig_tx)
     unmatched_curr_tx = []
     
     for c_t in curr_tx:
         exact = next((t for t in unmatched_orig_tx if 
-            t['box'] == c_t['box'] and 
-            t['base_description'] == c_t['base_description'] and 
-            t['date_sold'] == c_t['date_sold'] and 
-            t['quantity']['val'] == c_t['quantity']['val'] and
-            t['proceeds']['val'] == c_t['proceeds']['val'] and
-            t['cost_basis']['val'] == c_t['cost_basis']['val']
+            t['box'] == c_t['box'] and t['base_description'] == c_t['base_description'] and 
+            t['date_sold'] == c_t['date_sold'] and t['quantity']['val'] == c_t['quantity']['val'] and
+            t['proceeds']['val'] == c_t['proceeds']['val'] and t['cost_basis']['val'] == c_t['cost_basis']['val']
         ), None)
         if exact:
             unmatched_orig_tx.remove(exact)
@@ -460,10 +555,8 @@ def compare_statements(curr_tx, curr_info, curr_divs, orig_tx, orig_info, orig_d
             
     for c_t in unmatched_curr_tx:
         identity_match = next((t for t in unmatched_orig_tx if 
-            t['box'] == c_t['box'] and 
-            t['base_description'] == c_t['base_description'] and 
-            t['date_sold'] == c_t['date_sold'] and 
-            t['quantity']['val'] == c_t['quantity']['val']
+            t['box'] == c_t['box'] and t['base_description'] == c_t['base_description'] and 
+            t['date_sold'] == c_t['date_sold'] and t['quantity']['val'] == c_t['quantity']['val']
         ), None)
         
         if identity_match:
@@ -474,16 +567,41 @@ def compare_statements(curr_tx, curr_info, curr_divs, orig_tx, orig_info, orig_d
             log_diff(f"{ctx} Adjustments", identity_match['adjustments']['val'], c_t['adjustments']['val'], c_t['adjustments']['c'])
             log_diff(f"{ctx} Gain/Loss", identity_match['gain_loss']['val'], c_t['gain_loss']['val'], c_t['gain_loss']['c'])
         else:
-            discrepancies.append(f"[NEW] 1099-B Tx added: [{c_t['box']}] {c_t['base_description']} ({c_t['date_sold']}) Qty: {c_t['quantity']['val']:.4f}")
+            msg = f"[NEW] 1099-B Tx added: [{c_t['box']}] {c_t['base_description']} ({c_t['date_sold']}) Qty: {c_t['quantity']['val']:.4f}"
+            discrepancies.append(msg)
+            diffs_csv_rows.append({
+                'C_Flagged': 'Yes' if c_t['proceeds']['c'] else 'No',
+                'Change_Type': 'Added Transaction',
+                'Context': f"1099-B Tx [{c_t['box']}] {c_t['base_description']} ({c_t['date_sold']})",
+                'Original_Value': 'None',
+                'Current_Value': f"Qty: {c_t['quantity']['val']:.4f}"
+            })
+            print(f"{c_red}{msg}{c_res}")
             
     for o_t in unmatched_orig_tx:
-        discrepancies.append(f"[REMOVED] 1099-B Tx removed: [{o_t['box']}] {o_t['base_description']} ({o_t['date_sold']}) Qty: {o_t['quantity']['val']:.4f}")
+        msg = f"[REMOVED] 1099-B Tx removed: [{o_t['box']}] {o_t['base_description']} ({o_t['date_sold']}) Qty: {o_t['quantity']['val']:.4f}"
+        discrepancies.append(msg)
+        diffs_csv_rows.append({
+            'C_Flagged': 'N/A',
+            'Change_Type': 'Removed Transaction',
+            'Context': f"1099-B Tx [{o_t['box']}] {o_t['base_description']} ({o_t['date_sold']})",
+            'Original_Value': f"Qty: {o_t['quantity']['val']:.4f}",
+            'Current_Value': 'None'
+        })
+        print(f"{c_red}{msg}{c_res}")
 
     if discrepancies:
         try:
             with open(log_path, 'w', encoding='utf-8') as f:
                 f.write("\n".join(discrepancies))
-            print(f"{COLOR_CYAN}Comparison log saved to: {log_path}{COLOR_RESET}")
+            print(f"{COLOR_CYAN}Comparison text log saved to: {log_path}{COLOR_RESET}")
+            
+            csv_log_path = log_path.replace('.txt', '.csv')
+            with open(csv_log_path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=['C_Flagged', 'Change_Type', 'Context', 'Original_Value', 'Current_Value'])
+                writer.writeheader()
+                writer.writerows(diffs_csv_rows)
+            print(f"{COLOR_CYAN}Comparison CSV log saved to: {csv_log_path}{COLOR_RESET}")
         except IOError: pass
     else:
         print(f"{COLOR_GREEN}No value discrepancies found between statements.{COLOR_RESET}")
