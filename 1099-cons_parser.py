@@ -63,6 +63,8 @@ def clean_sec_name(name_parts):
     name = " ".join(name_parts)
     name = re.sub(r'\(cont.*?\)', '', name, flags=re.IGNORECASE)
     name = re.sub(r'\b\d{2}/\d{2}/\d{2}\b', '', name)
+    # Strip Vanguard footnote markers (e.g., "Note: 99" or "Note 99")
+    name = re.sub(r'\bNote:?\s*\d+\b', '', name, flags=re.IGNORECASE)
     return re.sub(r'\s{2,}', ' ', name).strip()
 
 def get_clean_pdf_lines(pdf_path):
@@ -184,6 +186,9 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
     supp_sec_pattern = re.compile(r'^([A-Z0-9\s\.\-\']+?)\s*/\s*([A-Z0-9]{9})(?:\s*/.*)?$')
     treasury_pattern = re.compile(r'U\.S\.\s*Treasury\s+([\d\.]+)')
     ny_pattern = re.compile(r'New York\s+([\d\.]+)')
+    
+    # Vanguard dynamic endnote parser (e.g. "99 For the Vanguard settlement fund (9999100), the U.S government obligation percentage is 66.61%.")
+    vanguard_note_pattern = re.compile(r'For the[^\(]{1,100}\(([A-Z0-9]+)\)[^%]{1,150}percentage is\s*([\d\.]+)%', re.IGNORECASE)
 
     current_global_box = None
     in_div_section = False
@@ -214,6 +219,16 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
                 
                 if not page_text: continue
                 if debug: debug_log["raw_pages"][f"page_{page_num + 1}"] = page_text
+                
+                # Active scan for Vanguard Endnotes anywhere on the page
+                flat_text = re.sub(r'\s+', ' ', page_text)
+                for endnote_match in vanguard_note_pattern.finditer(flat_text):
+                    supplemental_extracted.append({
+                        'name': 'UNKNOWN',
+                        'cusip': endnote_match.group(1).upper(),
+                        'fed_pct': clean_num(endnote_match.group(2)) / 100.0,
+                        'ny_pct': None
+                    })
                 
                 if "1099-DIV" in page_text.upper():
                     div_start_idx = page_text.upper().find("1099-DIV")
@@ -309,6 +324,8 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
                             
                         qty_str = data['qty'].replace(',', '')
                         base_desc = re.sub(r'\s*/\s*Symbol:?\s*$', '', current_1099b_sec, flags=re.IGNORECASE).strip()
+                        base_desc = re.sub(r'\bNote:?\s*\d+\b', '', base_desc, flags=re.IGNORECASE).strip()
+                        
                         formatted_desc = f"{qty_str} {base_desc}"
                         
                         tx = {
@@ -445,15 +462,10 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
             if is_c: correction_flags['securities'][clean_name][k] = True
 
     for supp in supplemental_extracted:
-        matched_sec = next((k for k, v in dividends_data.items() if v['cusip'] == supp['cusip'] or k.upper() == supp['name'].upper()), None)
+        matched_sec = next((k for k, v in dividends_data.items() if (v['cusip'] and v['cusip'] == supp['cusip']) or (supp['name'] != 'UNKNOWN' and k.upper() == supp['name'].upper())), None)
         if matched_sec:
             if supp['fed_pct'] is not None: dividends_data[matched_sec]['supplemental']['fed_pct'] = supp['fed_pct']
             if supp['ny_pct'] is not None: dividends_data[matched_sec]['supplemental']['ny_pct'] = supp['ny_pct']
-
-    for k, v in dividends_data.items():
-        known_val = KNOWN_GOVT_FUNDS.get(v['cusip']) or KNOWN_GOVT_FUNDS.get(k.upper()) or next((val for m_k, val in KNOWN_GOVT_FUNDS.items() if k.upper().startswith(m_k)), None)
-        if known_val is not None:
-            v['supplemental']['fed_pct'] = known_val
 
     if fed_csv_data:
         for k, v in dividends_data.items():
@@ -601,7 +613,6 @@ def compare_statements(p_info, p_divs, p_tx, c_info, c_divs, c_tx, p_path, c_pat
             p_sum = sum(x['amount'] for x in p_list)
             c_sum = sum(x['amount'] for x in c_list)
             
-            # If any transaction for this security on this date was marked with C, flag the whole block
             is_flagged = "Yes" if any(x.get('corrected', False) for x in c_list) else "No"
             
             diff = abs(p_sum - c_sum)
