@@ -21,111 +21,137 @@ COLOR_YELLOW = '\033[93m'
 COLOR_CYAN = '\033[96m'
 COLOR_RESET = '\033[0m'
 
-# Dictionary of funds known to hold US Government obligations. 
-# Used to prompt the user if percentages are completely missing from both the PDF and the CSV,
-# and to bypass strict 9-character CUSIP validation for non-standard internal IDs.
-KNOWN_GOVT_FUNDS = [
-    {'sec_name': 'VANGUARD FEDL MONEY MKT', 'cusip': '9999100'}
-]
+# Dictionary mapping known CUSIPs to Security Names requiring a Fed Source percentage
+KNOWN_GOVT_FUNDS = {
+    "9999100": "VANGUARD FEDL MONEY MKT"
+}
 
-def is_known_govt_fund(sec_name, cusip):
-    """Checks if a parsed security matches any known government fund profiles."""
-    sec_name_upper = sec_name.strip().upper()
-    cusip_upper = cusip.strip().upper()
-    for fund in KNOWN_GOVT_FUNDS:
-        if fund.get('sec_name') and sec_name_upper.startswith(fund['sec_name'].upper()):
-            return True
-        if fund.get('cusip') and cusip_upper.startswith(fund['cusip'].upper()):
-            return True
-    return False
-
-class DualLogger:
-    """Intercepts sys.stdout to write to the terminal, a color log, and a plain text log simultaneously."""
-    def __init__(self, color_log_path, plain_log_path):
+class MultiLogger:
+    """Writes to terminal, a color log, and a stripped non-color log simultaneously."""
+    def __init__(self, prefix):
         self.terminal = sys.stdout
-        self.color_log = open(color_log_path, 'w', encoding='utf-8')
-        self.plain_log = open(plain_log_path, 'w', encoding='utf-8')
+        self.log_color = open(f"{prefix}console_output_color.txt", "w", encoding="utf-8")
+        self.log_nocolor = open(f"{prefix}console_output.txt", "w", encoding="utf-8")
         self.ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 
     def write(self, message):
         self.terminal.write(message)
-        self.color_log.write(message)
-        self.plain_log.write(self.ansi_escape.sub('', message))
+        if not self.log_color.closed:
+            self.log_color.write(message)
+        if not self.log_nocolor.closed:
+            self.log_nocolor.write(self.ansi_escape.sub('', message))
 
     def flush(self):
         self.terminal.flush()
-        self.color_log.flush()
-        self.plain_log.flush()
+        if not self.log_color.closed:
+            self.log_color.flush()
+        if not self.log_nocolor.closed:
+            self.log_nocolor.flush()
         
     def close(self):
-        self.color_log.close()
-        self.plain_log.close()
-
-def parse_val_and_c(val_str):
-    """Parses a string into a float and detects if it has a 'C' (Corrected) flag."""
-    if not val_str or val_str == '...': 
-        return 0.0, False
-    val_str_upper = val_str.upper()
-    has_c = 'C' in val_str_upper
-    try:
-        clean_str = re.sub(r'[^\d\.\-]', '', val_str)
-        return float(clean_str), has_c
-    except ValueError:
-        return 0.0, False
+        if not self.log_color.closed:
+            self.log_color.close()
+        if not self.log_nocolor.closed:
+            self.log_nocolor.close()
 
 def clean_num(val):
-    return parse_val_and_c(val)[0]
+    if not val or val == '...': return 0.0
+    try: return float(str(val).replace(',', '').replace('%', ''))
+    except ValueError: return 0.0
 
 def clean_sec_name(name_parts):
-    """Joins buffered name parts and strips continuation markers and stray dates."""
     name = " ".join(name_parts)
     name = re.sub(r'\(cont.*?\)', '', name, flags=re.IGNORECASE)
     name = re.sub(r'\b\d{2}/\d{2}/\d{2}\b', '', name)
     return re.sub(r'\s{2,}', ' ', name).strip()
 
-def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_filepath=None, use_color=True):
+def get_clean_pdf_lines(pdf_path):
+    """Extracts layout text, dynamically identifies the statement date, removes it along with CORRECTED, and normalizes whitespace."""
+    lines = []
+    statement_date = None
+    try:
+        with open(pdf_path, 'rb') as file:
+            reader = pypdf.PdfReader(file)
+            
+            # First pass: dynamically find the specific statement date on page 1
+            if len(reader.pages) > 0:
+                first_page_text = reader.pages[0].extract_text(extraction_mode="layout") or ""
+                date_match = re.search(r'Statement Date:\s*(\d{2}/\d{2}/\d{4})', first_page_text, re.IGNORECASE)
+                if date_match:
+                    statement_date = date_match.group(1)
+
+            # Second pass: process all pages
+            for page in reader.pages:
+                text = page.extract_text(extraction_mode="layout")
+                if not text: continue
+                
+                for line in text.split('\n'):
+                    # 1. Remove the specifically found statement date from everywhere in this file
+                    if statement_date:
+                        line = line.replace(statement_date, '')
+                        
+                    # 2. Remove the optional CORRECTED string
+                    line = re.sub(r'\bCORRECTED\b', '', line, flags=re.IGNORECASE)
+                    
+                    # 3. Remove Document ID dynamic values to prevent meaningless false diffs
+                    line = re.sub(r'Document ID:\s*[A-Z0-9]+(?:\s+[A-Z0-9]+)*', 'Document ID:', line, flags=re.IGNORECASE)
+                    
+                    # 4. Collapse whitespace layout artifacts
+                    line = re.sub(r'\s+', ' ', line)
+                    stripped = line.strip()
+                    
+                    if stripped:
+                        lines.append(stripped)
+    except Exception: pass
+    return lines
+
+def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_filepath=None, use_color=True, is_comparison=False):
     transactions = []
     summary_expected = {}
     supplemental_extracted = []
-    raw_pages = {}
     
     info_1099 = {
-        '1a': {'val': 0.0, 'c': False}, '1b': {'val': 0.0, 'c': False}, 
-        '2a': {'val': 0.0, 'c': False}, '2b': {'val': 0.0, 'c': False}, 
-        '3': {'val': 0.0, 'c': False}, '5': {'val': 0.0, 'c': False}, 
-        '12': {'val': 0.0, 'c': False},
+        '1a': 0.0, '1b': 0.0, '2a': 0.0, '2b': 0.0, '3': 0.0, '5': 0.0, '12': 0.0,
         'grand_totals': {
-            'Total Dividends & distributions': {'val': 0.0, 'c': False},
-            'Total Tax-exempt dividends': {'val': 0.0, 'c': False},
-            'Total Foreign tax withheld': {'val': 0.0, 'c': False}
+            'Total Dividends & distributions': 0.0,
+            'Total Tax-exempt dividends': 0.0,
+            'Total Foreign tax withheld': 0.0
         }
+    }
+    
+    correction_flags = {
+        'info_1099': defaultdict(bool),
+        'grand_totals': defaultdict(bool),
+        'securities': defaultdict(lambda: defaultdict(bool)),
+        'transactions': []
     }
     
     working_div_data = defaultdict(lambda: {
         'name_parts': [],
         'cusip': '',
         'transactions': [],
-        'totals': defaultdict(lambda: {'val': 0.0, 'c': False}),
+        'totals': defaultdict(float),
         'supplemental': {}
     })
     
     debug_log = {
-        "metadata": {"target_boxes": target_boxes, "method": "layout"},
+        "metadata": {"target_boxes": target_boxes, "method": "layout", "is_comparison_run": is_comparison},
         "summary_expected": {},
         "categories": {box: {"transactions": []} for box in target_boxes},
         "dividends_and_supplemental": {},
+        "corrections_detected": {},
         "raw_pages": {}
     }
 
     def cprint(msg, color=None):
-        if not msg: return
+        if not msg or is_comparison: return
         if color and use_color: print(f"{color}{msg}{COLOR_RESET}")
         else: print(msg)
 
-    if debug: cprint(f"=== PARSING: {pdf_path} ===", COLOR_CYAN)
+    cprint(f"=== STARTING BROKERAGE 1099 PARSE: {os.path.basename(pdf_path)} ===", COLOR_CYAN)
 
     fed_csv_data = {}
-    if fed_csv_path:
+    if fed_csv_path and not is_comparison:
         try:
             with open(fed_csv_path, mode='r', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
@@ -136,36 +162,34 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
                         if key and val_str:
                             try: fed_csv_data[key] = float(val_str) / 100.0
                             except ValueError: pass
-        except Exception:
-            pass
+        except Exception: pass
 
     summary_row_pattern = re.compile(
         r'(B\s+or\s+E|C\s+or\s+F|A|B|C|D|E|F)\s*(?:\(basis.*?\)|\(Form.*?\))\s*'
-        r'([\d,]+\.\d{2}\s*[cC]?)\s*([\d,]+\.\d{2}\s*[cC]?)\s*([\d,]+\.\d{2}\s*[cC]?)\s*([\d,]+\.\d{2}\s*[cC]?)\s*([-\d,]+\.\d{2}\s*[cC]?)', re.IGNORECASE
+        r'([\d,]+\.\d{2})\s*([\d,]+\.\d{2})\s*([\d,]+\.\d{2})\s*([\d,]+\.\d{2})\s*([-\d,]+\.\d{2})', re.IGNORECASE
     )
     
     core_pattern = re.compile(
-        r'(?P<dsold>\d{2}/\d{2}/\d{2})\s+(?P<qty>[\d,]+\.\d+\s*[cC]?)\s+(?P<proceeds>[\d,]+\.\d{2}\s*[cC]?)\s+'
-        r'(?P<dacq>\d{2}/\d{2}/\d{2}|VARIOUS)\s+(?P<basis>[\d,]+\.\d{2}\s*[cC]?)\s*'
-        r'(?P<adj>[-\d,]+\.\d{2}\s*[cC]?|\.\.\.)?\s*(?P<gl>[-\d,]+\.\d{2}\s*[cC]?)(?P<addl_info>[^\n]*)', re.IGNORECASE
+        r'(?P<dsold>\d{2}/\d{2}/\d{2})\s+(?P<qty>[\d,]+\.\d+)\s+(?P<proceeds>[\d,]+\.\d{2})\s+'
+        r'(?P<dacq>\d{2}/\d{2}/\d{2}|VARIOUS)\s+(?P<basis>[\d,]+\.\d{2})\s*'
+        r'(?P<adj>[-\d,]+\.\d{2}|\.\.\.)?\s*(?P<gl>[-\d,]+\.\d{2})(?P<addl_info>[^\n]*)', re.IGNORECASE
     )
 
-    div_row_pattern = re.compile(r'^(.*?)\s*(\d{2}/\d{2}/\d{2})\s+([-\d,]+\.\d{2}\s*[cC]?)\s+(.*)$')
+    div_row_pattern = re.compile(r'^(.*?)\s*(\d{2}/\d{2}/\d{2})\s+([-\d,]+\.\d{2})\s+(.*)$')
     div_total_pattern = re.compile(
-        r'^(.*?)\s*([-\d,]+\.\d{2}\s*[cC]?)\s+(Total Dividends & distributions|Total Tax-exempt dividends|Total Foreign tax withheld)', 
+        r'^(.*?)\s*([-\d,]+\.\d{2})\s+(Total Dividends & distributions|Total Tax-exempt dividends|Total Foreign tax withheld)', 
         re.IGNORECASE
     )
     
-    # Updated to allow 7 to 9 character CUSIPs and swallow the trailing ticker symbol
-    supp_sec_pattern = re.compile(r'^(.*?)\s*/\s*([A-Z0-9]{7,9})(?:\s*/.*)?$')
-    fed_total_pattern = re.compile(r'Fed\s*Source\s*Total[\s:]*([\d\.]+)', re.IGNORECASE)
-    agency_pattern = re.compile(r'(?:U\.S\.\s*Treasury|Fed\s*Farm\s*Credit|TN\s*Valley\s*Auth|Fed\s*Home\s*Loan|Student\s*Loan|Other\s*Dir\.?\s*Fed\.?)\s+([\d\.]+)', re.IGNORECASE)
+    supp_sec_pattern = re.compile(r'^([A-Z0-9\s\.\-\']+?)\s*/\s*([A-Z0-9]{9})(?:\s*/.*)?$')
+    treasury_pattern = re.compile(r'U\.S\.\s*Treasury\s+([\d\.]+)')
     ny_pattern = re.compile(r'New York\s+([\d\.]+)')
 
     current_global_box = None
     in_div_section = False
     in_supp_section = False
     in_grand_totals = False
+    
     current_sec_id = None
     current_page_prefixes = []
     current_page_has_cont = False
@@ -178,37 +202,40 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
             for page_num in range(len(reader.pages)):
                 if current_sec_id and current_page_prefixes and not current_page_has_cont:
                     working_div_data[current_sec_id]['name_parts'].extend(current_page_prefixes)
+                
                 current_page_prefixes = []
                 current_page_has_cont = False
 
                 page = reader.pages[page_num]
                 try: page_text = page.extract_text(extraction_mode="layout")
                 except TypeError:
-                    cprint("\n[!] ERROR: pypdf is too old for layout extraction. Run: pip install --upgrade pypdf", COLOR_RED)
+                    if not is_comparison: cprint("\n[!] ERROR: pypdf is too old for layout extraction.", COLOR_RED)
                     sys.exit(1)
                 
                 if not page_text: continue
-                
-                raw_pages[f"page_{page_num + 1}"] = page_text
                 if debug: debug_log["raw_pages"][f"page_{page_num + 1}"] = page_text
                 
                 if "1099-DIV" in page_text.upper():
                     div_start_idx = page_text.upper().find("1099-DIV")
                     div_block = page_text[div_start_idx:]
                     for line_match in [
-                        (r'1a-\s*Total ordinary dividends.{0,150}?([\d,]+\.\d{2}\s*[cC]?)', '1a'),
-                        (r'1b-\s*Qualified dividends.{0,150}?([\d,]+\.\d{2}\s*[cC]?)', '1b'),
-                        (r'2a-\s*Total capital gain distributions.{0,150}?([\d,]+\.\d{2}\s*[cC]?)', '2a'),
-                        (r'2b-\s*Unrecaptured Section 1250 gain.{0,150}?([\d,]+\.\d{2}\s*[cC]?)', '2b'),
-                        (r'3-\s*Nondividend distributions.{0,150}?([\d,]+\.\d{2}\s*[cC]?)', '3'),
-                        (r'5-\s*Section 199A dividends.{0,150}?([\d,]+\.\d{2}\s*[cC]?)', '5'),
-                        (r'12-\s*Exempt-interest dividends.{0,150}?([\d,]+\.\d{2}\s*[cC]?)', '12'),
+                        (r'1a-\s*Total ordinary dividends.{0,150}?([\d,]+\.\d{2})', '1a'),
+                        (r'1b-\s*Qualified dividends.{0,150}?([\d,]+\.\d{2})', '1b'),
+                        (r'2a-\s*Total capital gain distributions.{0,150}?([\d,]+\.\d{2})', '2a'),
+                        (r'2b-\s*Unrecaptured Section 1250 gain.{0,150}?([\d,]+\.\d{2})', '2b'),
+                        (r'3-\s*Nondividend distributions.{0,150}?([\d,]+\.\d{2})', '3'),
+                        (r'5-\s*Section 199A dividends.{0,150}?([\d,]+\.\d{2})', '5'),
+                        (r'12-\s*Exempt-interest dividends.{0,150}?([\d,]+\.\d{2})', '12'),
                     ]:
                         m = re.search(line_match[0], div_block, re.DOTALL | re.IGNORECASE)
-                        if m: 
-                            val, has_c = parse_val_and_c(m.group(1))
-                            if val > info_1099[line_match[1]]['val']:
-                                info_1099[line_match[1]] = {'val': val, 'c': has_c}
+                        if m:
+                            val = clean_num(m.group(1))
+                            end_idx = m.end(1)
+                            is_corrected = bool(re.match(r'[ \t]*C\b', div_block[end_idx:end_idx+10]))
+                            
+                            info_1099[line_match[1]] = max(info_1099[line_match[1]], val)
+                            if is_corrected:
+                                correction_flags['info_1099'][line_match[1]] = True
 
                 lines = page_text.split('\n')
                 
@@ -224,16 +251,10 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
 
                 for sum_match in summary_row_pattern.finditer(page_text):
                     box = re.sub(r'\s+', ' ', sum_match.group(1)).upper()
-                    p_val, p_c = parse_val_and_c(sum_match.group(2))
-                    cb_val, cb_c = parse_val_and_c(sum_match.group(3))
-                    adj_val, adj_c = parse_val_and_c(sum_match.group(4))
-                    gl_val, gl_c = parse_val_and_c(sum_match.group(6))
-                    
                     summary_expected[box] = {
-                        'proceeds': {'val': p_val, 'c': p_c},
-                        'cost_basis': {'val': cb_val, 'c': cb_c},
-                        'adjustments': {'val': adj_val, 'c': adj_c},
-                        'gain_loss': {'val': gl_val, 'c': gl_c}
+                        'proceeds': clean_num(sum_match.group(2)), 'cost_basis': clean_num(sum_match.group(3)),
+                        'adjustments': clean_num(sum_match.group(4)) + clean_num(sum_match.group(5)),
+                        'gain_loss': clean_num(sum_match.group(6))
                     }
 
                 box_headers = [{'box': m.group(1).upper(), 'start': m.start()} for m in re.finditer(r'Box\s+([A-F])\s+checked', page_text, re.IGNORECASE)]
@@ -251,12 +272,12 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
                         start_desc = matches[i-1].end() if i > 0 else 0
                         between_text = page_text[start_desc:match.start()]
                         
-                        has_row_c = bool(re.search(r'(?:\s+[cC]\s*$|^\s*[cC]\s*$)', between_text, flags=re.MULTILINE))
-                        if data.get('addl_info') and re.search(r'(?:\s+[cC]\s*$|^\s*[cC]\s*$)', data['addl_info']):
-                            has_row_c = True
-                        
-                        anchors = [r'Additional\s*information', r'also\s*not\s*reported\s*\(Z\)', r'alsonotreported\(Z\)', r'Original\s*basis:\s*\$[\d,]+\.\d{2}']
-                        for anchor in anchors: between_text = re.split(anchor, between_text, flags=re.IGNORECASE)[-1]
+                        anchors = [
+                            r'Additional\s*information', r'also\s*not\s*reported\s*\(Z\)', 
+                            r'alsonotreported\(Z\)', r'Original\s*basis:\s*\$[\d,]+\.\d{2}'
+                        ]
+                        for anchor in anchors:
+                            between_text = re.split(anchor, between_text, flags=re.IGNORECASE)[-1]
                             
                         between_text = re.sub(r'Securitytotal:[\s\d\.\-,]+', '', between_text, flags=re.IGNORECASE)
                         between_text = re.sub(r'Totals:[\s\d\.\-,]+', '', between_text, flags=re.IGNORECASE)
@@ -278,22 +299,15 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
                         if valid_lines:
                             new_sec = " ".join(valid_lines)
                             new_sec = re.sub(r'\s{2,}', ' ', new_sec).strip()
-                            if new_sec: current_1099b_sec = new_sec
+                            if new_sec:
+                                current_1099b_sec = new_sec
                         
-                        qty_val, qty_c = parse_val_and_c(data['qty'])
-                        qty_str = f"{qty_val}".rstrip('0').rstrip('.') if '.' in f"{qty_val}" else f"{qty_val}"
-                        
-                        p_val, p_c = parse_val_and_c(data['proceeds'])
-                        cb_val, cb_c = parse_val_and_c(data['basis'])
-                        adj_val, adj_c = parse_val_and_c(data['adj']) if data['adj'] else (0.0, False)
-                        gl_val, gl_c = parse_val_and_c(data['gl'])
-                        
-                        qty_c = qty_c or has_row_c
-                        p_c = p_c or has_row_c
-                        cb_c = cb_c or has_row_c
-                        adj_c = adj_c or has_row_c
-                        gl_c = gl_c or has_row_c
-                        
+                        addl_info = data['addl_info'].strip()
+                        is_corrected_tx = False
+                        if re.search(r'\bC$', addl_info):
+                            is_corrected_tx = True
+                            
+                        qty_str = data['qty'].replace(',', '')
                         base_desc = re.sub(r'\s*/\s*Symbol:?\s*$', '', current_1099b_sec, flags=re.IGNORECASE).strip()
                         formatted_desc = f"{qty_str} {base_desc}"
                         
@@ -301,13 +315,14 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
                             'box': box, 
                             'description': formatted_desc, 
                             'base_description': base_desc,
-                            'date_sold': data['dsold'], 
-                            'date_acquired': data['dacq'],
-                            'quantity': {'val': qty_val, 'c': qty_c},
-                            'proceeds': {'val': p_val, 'c': p_c},
-                            'cost_basis': {'val': cb_val, 'c': cb_c},
-                            'adjustments': {'val': adj_val, 'c': adj_c},
-                            'gain_loss': {'val': gl_val, 'c': gl_c}
+                            'date_sold': data['dsold'],
+                            'quantity': qty_str, 
+                            'proceeds': data['proceeds'].replace(',', ''),
+                            'date_acquired': data['dacq'], 
+                            'cost_basis': data['basis'].replace(',', ''),
+                            'adjustments': data['adj'].replace(',', '') if data['adj'] else "0.00",
+                            'gain_loss': data['gl'].replace(',', ''),
+                            'corrected': is_corrected_tx
                         }
                         transactions.append(tx)
                 if box_headers: current_global_box = box_headers[-1]['box']
@@ -318,20 +333,32 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
                     
                     if in_div_section:
                         p_lower = line.lower()
-                        if any(x in p_lower for x in ["security description", "detail for dividends", "page", "1099-div"]): continue
+                        if any(x in p_lower for x in ["security description", "detail for dividends", "page", "1099-div"]):
+                            continue
                             
                         ld = {}
                         tot_match = div_total_pattern.match(line)
                         row_match = div_row_pattern.match(line)
                         
                         if tot_match:
-                            ld = {'type': 'total', 'prefix': tot_match.group(1).strip(), 'amount': tot_match.group(2), 'desc': tot_match.group(3).strip()}
+                            rest_of_line = line[tot_match.end():]
+                            is_corrected = bool(re.search(r'\bC\b', rest_of_line))
+                            
+                            ld = {'type': 'total', 'prefix': tot_match.group(1).strip(), 'amount': clean_num(tot_match.group(2)), 'desc': tot_match.group(3).strip(), 'corrected': is_corrected}
                         elif row_match:
-                            ld = {'type': 'transaction', 'prefix': row_match.group(1).strip(), 'date': row_match.group(2), 'amount': row_match.group(3), 'desc': row_match.group(4).strip()}
+                            desc = row_match.group(4).strip()
+                            is_corrected = False
+                            
+                            if re.search(r'\bC$', desc):
+                                is_corrected = True
+                                desc = re.sub(r'\s+C$', '', desc).strip()
+                                
+                            ld = {'type': 'transaction', 'prefix': row_match.group(1).strip(), 'date': row_match.group(2), 'amount': clean_num(row_match.group(3)), 'desc': desc, 'corrected': is_corrected}
                         else:
                             ld = {'type': 'text', 'prefix': line.strip()}
                             
                         prefix = ld['prefix']
+                        
                         is_new_sec, cusip, name = False, "", ""
                         if prefix:
                             parts = re.split(r'\s{2,}', prefix)
@@ -340,18 +367,21 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
                                 alpha_match = re.match(r'^([A-Z0-9]{9})\b', raw_cusip, re.IGNORECASE)
                                 if alpha_match:
                                     is_new_sec, cusip, name = True, alpha_match.group(1).upper(), parts[0].strip()
-                                elif is_known_govt_fund(parts[0].strip(), raw_cusip):
+                                elif raw_cusip.startswith("9999100"):
                                     alpha_match = re.match(r'^([A-Z0-9]+)', raw_cusip, re.IGNORECASE)
                                     is_new_sec, cusip, name = True, alpha_match.group(1).upper() if alpha_match else raw_cusip.upper(), parts[0].strip()
                         
                         if is_new_sec:
                             if current_sec_id and current_page_prefixes and not current_page_has_cont:
                                 working_div_data[current_sec_id]['name_parts'].extend(current_page_prefixes)
+                            
                             current_page_prefixes = []
                             current_page_has_cont = False
+                            
                             current_sec_id = f"{cusip}_{name}"
                             working_div_data[current_sec_id]['cusip'] = cusip
                             if name: working_div_data[current_sec_id]['name_parts'].append(name)
+                            
                             in_grand_totals = False
                             prefix = ""
                             
@@ -360,15 +390,7 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
                             if "(cont" in prefix.lower(): current_page_has_cont = True
                                 
                         if ld['type'] == 'total' and current_sec_id:
-                            t_raw = ld['desc']
-                            amt_val, amt_c = parse_val_and_c(ld['amount'])
-                            
-                            desc_junk_match = re.search(r'\s{2,}[\d\s]*[cC]?\s*$', t_raw)
-                            if desc_junk_match:
-                                if 'C' in desc_junk_match.group().upper():
-                                    amt_c = True
-                                t_raw = t_raw[:desc_junk_match.start()].strip()
-                                
+                            t_raw, amt = ld['desc'], ld['amount']
                             if 'tax-exempt' in t_raw.lower(): t_type = 'Total Tax-exempt dividends'
                             elif 'foreign' in t_raw.lower(): t_type = 'Total Foreign tax withheld'
                             else: t_type = 'Total Dividends & distributions'
@@ -381,52 +403,26 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
                                    (t_type == 'Total Foreign tax withheld' and 'Total Foreign tax withheld' in working_div_data[current_sec_id]['totals']):
                                     in_grand_totals = True
 
-                            if in_grand_totals:
-                                if amt_val > info_1099['grand_totals'][t_type]['val']:
-                                    info_1099['grand_totals'][t_type] = {'val': amt_val, 'c': amt_c}
-                            else:
-                                working_div_data[current_sec_id]['totals'][t_type] = {'val': amt_val, 'c': amt_c}
+                            if in_grand_totals: 
+                                info_1099['grand_totals'][t_type] = max(info_1099['grand_totals'].get(t_type, 0.0), amt)
+                                if ld['corrected']: correction_flags['grand_totals'][t_type] = True
+                            else: 
+                                working_div_data[current_sec_id]['totals'][t_type] = amt
+                                if ld['corrected']: correction_flags['securities'][current_sec_id][t_type] = True
                                 
                         elif ld['type'] == 'transaction' and current_sec_id:
-                            t_desc = ld['desc']
-                            amt_val, amt_c = parse_val_and_c(ld['amount'])
-                            
-                            desc_junk_match = re.search(r'\s{2,}[\d\s]*[cC]?\s*$', t_desc)
-                            if desc_junk_match:
-                                if 'C' in desc_junk_match.group().upper():
-                                    amt_c = True
-                                t_desc = t_desc[:desc_junk_match.start()].strip()
-                                
                             working_div_data[current_sec_id]['transactions'].append({
-                                'date': ld['date'], 'amount': {'val': amt_val, 'c': amt_c}, 'type': t_desc
+                                'date': ld['date'], 'amount': ld['amount'], 'type': ld['desc'], 'corrected': ld['corrected']
                             })
                             
                     elif in_supp_section:
                         sec_match = supp_sec_pattern.search(line)
                         if sec_match:
-                            supplemental_extracted.append({
-                                'name': sec_match.group(1).strip(), 
-                                'cusip': sec_match.group(2).strip().upper(), 
-                                'fed_pct': None, 
-                                'ny_pct': None,
-                                'has_fed_total': False,
-                                'agency_sum': 0.0,
-                                'has_agency': False
-                            })
+                            supplemental_extracted.append({'name': sec_match.group(1).strip(), 'cusip': sec_match.group(2).strip().upper(), 'fed_pct': None, 'ny_pct': None})
                         elif supplemental_extracted:
-                            fed_tot_m = fed_total_pattern.search(line)
-                            ny_m = ny_pattern.search(line)
-                            
-                            if fed_tot_m:
-                                supplemental_extracted[-1]['fed_pct'] = clean_num(fed_tot_m.group(1)) / 100.0
-                                supplemental_extracted[-1]['has_fed_total'] = True
-                            elif not supplemental_extracted[-1].get('has_fed_total'):
-                                for agency_match in agency_pattern.finditer(line):
-                                    supplemental_extracted[-1]['agency_sum'] += clean_num(agency_match.group(1)) / 100.0
-                                    supplemental_extracted[-1]['has_agency'] = True
-                                    
-                            if ny_m: 
-                                supplemental_extracted[-1]['ny_pct'] = clean_num(ny_m.group(1)) / 100.0
+                            t_m, ny_m = treasury_pattern.search(line), ny_pattern.search(line)
+                            if t_m: supplemental_extracted[-1]['fed_pct'] = clean_num(t_m.group(1)) / 100.0
+                            if ny_m: supplemental_extracted[-1]['ny_pct'] = clean_num(ny_m.group(1)) / 100.0
 
             if current_sec_id and current_page_prefixes and not current_page_has_cont:
                 working_div_data[current_sec_id]['name_parts'].extend(current_page_prefixes)
@@ -435,7 +431,7 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
         print(f"Error: Could not find file {pdf_path}")
         sys.exit(1)
 
-    dividends_data = defaultdict(lambda: {'cusip': '', 'transactions': [], 'totals': defaultdict(lambda: {'val':0.0, 'c':False}), 'supplemental': {}})
+    dividends_data = defaultdict(lambda: {'cusip': '', 'transactions': [], 'totals': defaultdict(float), 'supplemental': {}})
     for sec_id, data in working_div_data.items():
         if not data['name_parts']: continue
         clean_name = clean_sec_name(data['name_parts'])
@@ -443,381 +439,280 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
             dividends_data[clean_name]['cusip'] = data['cusip']
             dividends_data[clean_name]['supplemental'] = data['supplemental']
         dividends_data[clean_name]['transactions'].extend(data['transactions'])
-        for k, v in data['totals'].items(): 
-            dividends_data[clean_name]['totals'][k] = {'val': dividends_data[clean_name]['totals'][k]['val'] + v['val'], 'c': v['c']}
+        for k, v in data['totals'].items(): dividends_data[clean_name]['totals'][k] += v
+        
+        for k, is_c in correction_flags['securities'][sec_id].items():
+            if is_c: correction_flags['securities'][clean_name][k] = True
 
     for supp in supplemental_extracted:
         matched_sec = next((k for k, v in dividends_data.items() if v['cusip'] == supp['cusip'] or k.upper() == supp['name'].upper()), None)
         if matched_sec:
-            final_fed_pct = None
-            if supp.get('has_fed_total'):
-                final_fed_pct = supp.get('fed_pct')
-            elif supp.get('has_agency'):
-                final_fed_pct = supp.get('agency_sum')
-                
-            if final_fed_pct is not None:
-                dividends_data[matched_sec]['supplemental']['fed_pct'] = final_fed_pct
-            if supp['ny_pct'] is not None: 
-                dividends_data[matched_sec]['supplemental']['ny_pct'] = supp['ny_pct']
+            if supp['fed_pct'] is not None: dividends_data[matched_sec]['supplemental']['fed_pct'] = supp['fed_pct']
+            if supp['ny_pct'] is not None: dividends_data[matched_sec]['supplemental']['ny_pct'] = supp['ny_pct']
 
-    csv_needs_update = False
-    if fed_csv_path:
-        for sec_name, data in dividends_data.items():
-            cusip = data.get('cusip', '')
-            pdf_fed_pct = data['supplemental'].get('fed_pct')
-            save_key = cusip if cusip else sec_name.strip().upper()
+    for k, v in dividends_data.items():
+        known_val = KNOWN_GOVT_FUNDS.get(v['cusip']) or KNOWN_GOVT_FUNDS.get(k.upper()) or next((val for m_k, val in KNOWN_GOVT_FUNDS.items() if k.upper().startswith(m_k)), None)
+        if known_val is not None:
+            v['supplemental']['fed_pct'] = known_val
 
-            if pdf_fed_pct is not None:
-                csv_val = fed_csv_data.get(save_key)
-                if csv_val is None or abs(csv_val - pdf_fed_pct) > 0.0001:
-                    fed_csv_data[save_key] = pdf_fed_pct
-                    csv_needs_update = True
-            else:
-                override = fed_csv_data.get(cusip) or fed_csv_data.get(sec_name.strip().upper()) or next((ov for mk, ov in fed_csv_data.items() if sec_name.strip().upper().startswith(mk)), None)
-                if override is not None:
-                    data['supplemental']['fed_pct'] = override
+    if fed_csv_data:
+        for k, v in dividends_data.items():
+            override = fed_csv_data.get(v['cusip']) or fed_csv_data.get(k.upper()) or next((ov for mk, ov in fed_csv_data.items() if k.upper().startswith(mk)), None)
+            if override is not None: v['supplemental']['fed_pct'] = override
 
-        if csv_needs_update:
+    if debug:
+        debug_log["dividends_and_supplemental"] = {k: dict(v) for k, v in dividends_data.items() if v['transactions']}
+        debug_log["document_grand_totals"] = info_1099['grand_totals']
+        debug_log["corrections_detected"] = {
+            'info_1099': dict(correction_flags['info_1099']),
+            'grand_totals': dict(correction_flags['grand_totals']),
+            'securities': {k: dict(v) for k, v in correction_flags['securities'].items()}
+        }
+        if log_filepath:
             try:
-                with open(fed_csv_path, 'w', newline='', encoding='utf-8') as f:
-                    writer = csv.writer(f)
-                    writer.writerow(["CUSIP or Description", "Fed source percentage"])
-                    for k, v in fed_csv_data.items():
-                        pct_str = f"{v * 100:.6f}".rstrip('0').rstrip('.')
-                        if pct_str == '': pct_str = '0'
-                        writer.writerow([k, pct_str])
-                cprint(f"[+] Updated {fed_csv_path} with primary values extracted from PDF.", COLOR_GREEN)
-            except IOError as e:
-                cprint(f"[!] Error updating {fed_csv_path}: {e}", COLOR_RED)
+                with open(log_filepath, 'w', encoding='utf-8') as f: json.dump(debug_log, f, indent=2)
+            except IOError as e: cprint(f"[!] Error writing debug JSON log: {e}", COLOR_RED)
 
-    if debug and log_filepath:
+    return transactions, summary_expected, dividends_data, info_1099, correction_flags
+
+def print_corrected_items(correction_flags, transactions, dividends_data, use_color=True):
+    c_y, c_res = (COLOR_YELLOW, COLOR_RESET) if use_color else ("", "")
+    print(f"\n{c_y}--- Corrected Items Detected ('C' Marker) ---{c_res}")
+    
+    found_any = False
+    
+    if any(correction_flags['info_1099'].values()):
+        found_any = True
+        print("  [1099-DIV Summary Boxes]")
+        for k, is_c in correction_flags['info_1099'].items():
+            if is_c: print(f"    - Box {k}")
+            
+    if any(correction_flags['grand_totals'].values()):
+        found_any = True
+        print("  [Document Grand Totals]")
+        for k, is_c in correction_flags['grand_totals'].items():
+            if is_c: print(f"    - {k}")
+            
+    if correction_flags['securities']:
+        sec_found = False
+        for sec, flags in correction_flags['securities'].items():
+            if any(flags.values()):
+                if not sec_found:
+                    print("  [Security Totals]")
+                    sec_found = True
+                    found_any = True
+                for k, is_c in flags.items():
+                    if is_c: print(f"    - {sec}: {k}")
+                    
+    div_tx_found = False
+    for sec, data in dividends_data.items():
+        for t in data['transactions']:
+            if t.get('corrected'):
+                if not div_tx_found:
+                    print("  [Dividend Transactions]")
+                    div_tx_found = True
+                    found_any = True
+                print(f"    - {sec} | Date: {t['date']} | Amount: {t['amount']} ({t['type']})")
+                
+    tx_found = False
+    for tx in transactions:
+        if tx.get('corrected'):
+            if not tx_found:
+                print("  [1099-B Sales Transactions]")
+                tx_found = True
+                found_any = True
+            desc_short = tx['base_description'][:25] + "..." if len(tx['base_description']) > 25 else tx['base_description']
+            print(f"    - Box {tx['box']} | {desc_short} | Sold: {tx['date_sold']} | Qty: {tx['quantity']}")
+                    
+    if not found_any:
+        print("  No correction markers found.")
+
+def compare_statements(p_info, p_divs, p_tx, c_info, c_divs, c_tx, p_path, c_path, prefix_str, correction_flags, log_filepath=None, use_color=True):
+    c_c, c_y, c_g, c_r, c_res = (COLOR_CYAN, COLOR_YELLOW, COLOR_GREEN, COLOR_RED, COLOR_RESET) if use_color else ("", "", "", "", "")
+    
+    txt_log_path = f"{prefix_str}comparison.txt"
+    csv_log_path = f"{prefix_str}comparison.csv"
+    
+    txt_file = open(txt_log_path, 'w', encoding='utf-8')
+    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+    
+    def cmp_print(msg):
+        print(msg)
+        txt_file.write(ansi_escape.sub('', msg) + '\n')
+    
+    cmp_print(f"\n{c_c}--- STATEMENT COMPARISON (Previous vs Current) ---{c_res}")
+    
+    diff_log = []
+    def log_diff(section, desc, old_val, new_val, c_flagged):
+        msg = f"  {desc}:\n    From: {old_val}\n    To  : {new_val}\n    C_Flagged: {c_flagged}"
+        cmp_print(msg)
+        diff_log.append({"section": section, "description": desc, "previous": old_val, "current": new_val, "C_Flagged": c_flagged})
+
+    # 1. Summary Compare
+    cmp_print("\n[1099-DIV Summary Boxes]")
+    fields = {'1a': '1a- Total ordinary dividends', '1b': '1b- Qualified dividends', '2a': '2a- Total capital gain', '2b': '2b- Unrecaptured Section 1250', '3': '3- Nondividend distributions', '5': '5- Section 199A', '12': '12- Exempt-interest dividends'}
+    has_summ_diff = False
+    for k, label in fields.items():
+        if p_info[k] != c_info[k]:
+            is_flagged = "Yes" if correction_flags['info_1099'].get(k, False) else "No"
+            log_diff("1099-DIV Summary", label, p_info[k], c_info[k], is_flagged)
+            has_summ_diff = True
+    if not has_summ_diff: cmp_print("  No changes.")
+
+    # 2. Grand Totals Compare
+    cmp_print("\n[Document Grand Totals]")
+    has_gt_diff = False
+    for k in c_info['grand_totals']:
+        p_val = p_info['grand_totals'].get(k, 0.0)
+        c_val = c_info['grand_totals'].get(k, 0.0)
+        if p_val != c_val:
+            is_flagged = "Yes" if correction_flags['grand_totals'].get(k, False) else "No"
+            log_diff("Grand Totals", k, p_val, c_val, is_flagged)
+            has_gt_diff = True
+    if not has_gt_diff: cmp_print("  No changes.")
+
+    # 3. Dividend Transaction Detail Recharacterization Compare
+    cmp_print("\n[Dividend Transaction Detail Changes]")
+    has_div_tx_diff = False
+    all_secs = set(p_divs.keys()).union(c_divs.keys())
+    for sec in sorted(all_secs):
+        p_txs = p_divs.get(sec, {}).get('transactions', [])
+        c_txs = c_divs.get(sec, {}).get('transactions', [])
+        
+        if not p_txs and not c_txs: continue
+        
+        p_by_date = defaultdict(list)
+        for t in p_txs: p_by_date[t['date']].append(t)
+        
+        c_by_date = defaultdict(list)
+        for t in c_txs: c_by_date[t['date']].append(t)
+        
+        all_dates = sorted(set(p_by_date.keys()).union(c_by_date.keys()), key=lambda d: d[6:8]+d[0:2]+d[3:5])
+        
+        for date in all_dates:
+            p_list = p_by_date[date]
+            c_list = c_by_date[date]
+            
+            p_breakdown = ", ".join([f"${x['amount']:.2f} ({x['type']})" for x in p_list])
+            c_breakdown = ", ".join([f"${x['amount']:.2f} ({x['type']})" for x in c_list])
+            
+            if p_breakdown == c_breakdown: continue
+            
+            p_sum = sum(x['amount'] for x in p_list)
+            c_sum = sum(x['amount'] for x in c_list)
+            
+            # If any transaction for this security on this date was marked with C, flag the whole block
+            is_flagged = "Yes" if any(x.get('corrected', False) for x in c_list) else "No"
+            
+            diff = abs(p_sum - c_sum)
+            if diff < 0.02 and len(p_list) > 0 and len(c_list) > 0:
+                log_diff("Dividend Detail", f"{sec} on {date}", f"Total ${p_sum:.2f} [ {p_breakdown} ]", f"Total ${c_sum:.2f} (Recharacterized) [ {c_breakdown} ]", is_flagged)
+                has_div_tx_diff = True
+            else:
+                log_diff("Dividend Detail", f"{sec} on {date}", f"Total ${p_sum:.2f} [ {p_breakdown} ]" if p_list else "None", f"Total ${c_sum:.2f} [ {c_breakdown} ]" if c_list else "None", is_flagged)
+                has_div_tx_diff = True
+    if not has_div_tx_diff: cmp_print("  No changes.")
+
+    # 4. 1099-B Proceeds Transaction Compare
+    cmp_print("\n[1099-B Proceeds from Broker Transactions]")
+    has_1099b_diff = False
+    
+    p_tx_map = defaultdict(list)
+    for tx in p_tx:
+        key = f"{tx['box']}|{tx['base_description']}|{tx['date_sold']}|{tx['quantity']}"
+        p_tx_map[key].append(tx)
+        
+    c_tx_map = defaultdict(list)
+    for tx in c_tx:
+        key = f"{tx['box']}|{tx['base_description']}|{tx['date_sold']}|{tx['quantity']}"
+        c_tx_map[key].append(tx)
+        
+    all_tx_keys = sorted(set(p_tx_map.keys()).union(c_tx_map.keys()))
+    
+    for key in all_tx_keys:
+        p_list = p_tx_map[key]
+        c_list = c_tx_map[key]
+        
+        max_len = max(len(p_list), len(c_list))
+        for i in range(max_len):
+            p_item = p_list[i] if i < len(p_list) else None
+            c_item = c_list[i] if i < len(c_list) else None
+            
+            parts = key.split('|')
+            desc_short = parts[1][:25] + "..." if len(parts[1]) > 25 else parts[1]
+            row_label = f"Box {parts[0]} | {desc_short} | Sold: {parts[2]} | Qty: {parts[3]}"
+            
+            is_flagged = "Yes" if (c_item and c_item.get('corrected', False)) else "No"
+            
+            if p_item and c_item:
+                changes = []
+                for f in ['proceeds', 'cost_basis', 'gain_loss', 'adjustments']:
+                    if abs(clean_num(p_item[f]) - clean_num(c_item[f])) > 0.01:
+                        changes.append(f"{f}: {p_item[f]} -> {c_item[f]}")
+                
+                if changes:
+                    change_str = ", ".join(changes)
+                    log_diff("1099-B Detail", row_label, "Previous Values", f"Changed: {change_str}", is_flagged)
+                    has_1099b_diff = True
+            elif not p_item and c_item:
+                log_diff("1099-B Detail", row_label, "Not Present", f"Added (Proceeds: {c_item['proceeds']}, Gain/Loss: {c_item['gain_loss']})", is_flagged)
+                has_1099b_diff = True
+            elif p_item and not c_item:
+                log_diff("1099-B Detail", row_label, f"Present (Proceeds: {p_item['proceeds']}, Gain/Loss: {p_item['gain_loss']})", "Removed", is_flagged)
+                has_1099b_diff = True
+                
+    if not has_1099b_diff: cmp_print("  No changes.")
+    
+    # Write Dedicated CSV Output
+    if diff_log:
         try:
-            with open(log_filepath, 'w', encoding='utf-8') as f: json.dump(debug_log, f, indent=2)
-        except IOError: pass
-
-    return transactions, summary_expected, dividends_data, info_1099, raw_pages
-
-def run_text_comparison(orig_pages, curr_pages, log_path, use_color):
-    c_cyan = COLOR_CYAN if use_color else ""
-    c_res = COLOR_RESET if use_color else ""
-    c_red = COLOR_RED if use_color else ""
-    c_green = COLOR_GREEN if use_color else ""
-    c_yellow = COLOR_YELLOW if use_color else ""
+            with open(csv_log_path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=["section", "description", "previous", "current", "C_Flagged"])
+                writer.writeheader()
+                writer.writerows(diff_log)
+            cmp_print(f"\n    [+] Created: {csv_log_path} ({len(diff_log)} changes tracked)")
+        except IOError as e:
+            cmp_print(f"    [!] Error writing {csv_log_path}: {e}")
     
-    print(f"\n{c_cyan}--- Running General Text Comparison ---{c_res}")
+    # 5. Raw Text Diff Fallback
+    cmp_print(f"\n{c_y}--- RAW TEXT DIFFERENCES (Exempting Statement Date & 'CORRECTED') ---{c_res}")
+    p_lines = get_clean_pdf_lines(p_path)
+    c_lines = get_clean_pdf_lines(c_path)
     
-    def find_statement_date(pages):
-        for i in range(1, len(pages) + 1):
-            text = pages.get(f"page_{i}", "")
-            m = re.search(r'Statement Date:\s*(\d{2}/\d{2}/\d{4})', text, re.IGNORECASE)
-            if m: return m.group(1)
-        return "Unknown"
-        
-    orig_date = find_statement_date(orig_pages)
-    curr_date = find_statement_date(curr_pages)
-    
-    orig_date_pattern = r'\b' + re.escape(orig_date) + r'\b' if orig_date != "Unknown" else r'\b\d{2}/\d{2}/\d{4}\b'
-    curr_date_pattern = r'\b' + re.escape(curr_date) + r'\b' if curr_date != "Unknown" else r'\b\d{2}/\d{2}/\d{4}\b'
-    
-    other_diffs = []
-    header_pages = []
-    
-    max_pages = max(len(orig_pages), len(curr_pages))
-    for page_num in range(1, max_pages + 1):
-        o_text = orig_pages.get(f"page_{page_num}", "")
-        c_text = curr_pages.get(f"page_{page_num}", "")
-        
-        o_lines = [re.sub(r'\s+', ' ', l).strip() for l in o_text.split('\n') if l.strip()]
-        c_lines = [re.sub(r'\s+', ' ', l).strip() for l in c_text.split('\n') if l.strip()]
-        
-        sm = difflib.SequenceMatcher(None, o_lines, c_lines)
-        for tag, i1, i2, j1, j2 in sm.get_opcodes():
-            if tag == 'equal': continue
-            
-            o_chunk = o_lines[i1:i2]
-            c_chunk = c_lines[j1:j2]
-            
-            clean_o = " ".join(o_chunk)
-            clean_o = re.sub(orig_date_pattern, '', clean_o)
-            clean_o = re.sub(r'\bCORRECTED\b', '', clean_o, flags=re.IGNORECASE)
-            clean_o = re.sub(r'\s+', ' ', clean_o).strip()
-            
-            clean_c = " ".join(c_chunk)
-            clean_c = re.sub(curr_date_pattern, '', clean_c)
-            clean_c = re.sub(r'\bCORRECTED\b', '', clean_c, flags=re.IGNORECASE)
-            clean_c = re.sub(r'\s+', ' ', clean_c).strip()
-            
-            if clean_o == clean_c:
-                if page_num not in header_pages:
-                    header_pages.append(page_num)
-            else:
-                context = o_lines[max(0, i1-1):i1]
-                other_diffs.append({
-                    'page': page_num,
-                    'removed': o_chunk,
-                    'added': c_chunk,
-                    'context': context
-                })
-                
-    log_entries = []
-    if not other_diffs and header_pages:
-        msg1 = "The only textual difference between the documents is the Statement Date and/or the 'CORRECTED' label."
-        msg2 = f"Original Date: {orig_date} -> Current Date: {curr_date}"
-        msg3 = f"This change was detected on pages: {', '.join(map(str, header_pages))}"
-        print(f"{c_green}{msg1}\n{msg2}\n{msg3}{c_res}")
-        log_entries.extend([msg1, msg2, msg3])
-    elif not other_diffs and not header_pages:
-        msg = "The documents are textually identical."
-        print(f"{c_green}{msg}{c_res}")
-        log_entries.append(msg)
+    diff = list(difflib.unified_diff(p_lines, c_lines, fromfile='Original', tofile='Corrected', lineterm=''))
+    if not diff:
+        cmp_print("  No raw text differences found.")
     else:
-        msg = "Found unstructured text differences between the documents:"
-        print(f"{c_yellow}{msg}{c_res}")
-        log_entries.append(msg)
-        
-        if header_pages:
-            h_msg = f"  - Statement Date changed (Original: {orig_date} -> Current: {curr_date}) and/or 'CORRECTED' status modified on pages: {', '.join(map(str, header_pages))}"
-            print(f"{c_yellow}{h_msg}{c_res}")
-            log_entries.append(h_msg)
+        for line in diff:
+            if line.startswith('---') or line.startswith('+++') or line.startswith('@@'):
+                continue
+            if line.startswith('-'): cmp_print(f"{c_r}{line}{c_res}")
+            elif line.startswith('+'): cmp_print(f"{c_g}{line}{c_res}")
             
-        for diff in other_diffs:
-            p_msg = f"\nPage {diff['page']}:"
-            print(f"{c_cyan}{p_msg}{c_res}")
-            log_entries.append(p_msg)
-            
-            if diff['context']:
-                c_msg = f"  Context: \"{diff['context'][0]}\""
-                print(c_msg)
-                log_entries.append(c_msg)
-                
-            for r in diff['removed']:
-                r_msg = f"  - {r}"
-                print(f"{c_red}{r_msg}{c_res}")
-                log_entries.append(r_msg)
-                
-            for a in diff['added']:
-                a_msg = f"  + {a}"
-                print(f"{c_green}{a_msg}{c_res}")
-                log_entries.append(a_msg)
-                
-    try:
-        with open(log_path, 'a', encoding='utf-8') as f:
-            f.write("\n\n--- General Text Comparison ---\n")
-            f.write("\n".join(log_entries))
-        print(f"{c_cyan}General text comparison appended to: {log_path}{c_res}")
-    except IOError:
-        pass
-
-def compare_statements(curr_tx, curr_info, curr_divs, curr_pages, orig_tx, orig_info, orig_divs, orig_pages, log_path, use_color=True):
-    c_red = COLOR_RED if use_color else ""
-    c_yellow = COLOR_YELLOW if use_color else ""
-    c_res = COLOR_RESET if use_color else ""
+    cmp_print("")
+    txt_file.close()
     
-    discrepancies = []
-    diffs_csv_rows = []
-    
-    def log_diff(context, old_val, new_val, is_c, change_type="Modified Value"):
-        if old_val == new_val: return
-        flag_str = "[C-FLAGGED]" if is_c else "[UNMARKED CHANGE]"
-        msg = f"{flag_str} {context}: Original: {old_val:.2f} -> Current: {new_val:.2f}"
-        discrepancies.append(msg)
-        
-        diffs_csv_rows.append({
-            'C_Flagged': 'Yes' if is_c else 'No',
-            'Change_Type': change_type,
-            'Context': context,
-            'Original_Value': f"{old_val:.2f}",
-            'Current_Value': f"{new_val:.2f}"
-        })
-        
-        if not is_c: print(f"{c_red}{msg}{c_res}")
-        else: print(f"{c_yellow}{msg}{c_res}")
-
-    print(f"\n{COLOR_CYAN}--- Running Original vs Current Comparison ---{COLOR_RESET}")
-    
-    for key in ['1a', '1b', '2a', '2b', '3', '5', '12']:
-        log_diff(f"Summary Box {key}", orig_info[key]['val'], curr_info[key]['val'], curr_info[key]['c'])
-        
-    for key in ['Total Dividends & distributions', 'Total Tax-exempt dividends']:
-        log_diff(f"Grand Total '{key}'", orig_info['grand_totals'][key]['val'], curr_info['grand_totals'][key]['val'], curr_info['grand_totals'][key]['c'])
-
-    for sec, c_data in curr_divs.items():
-        o_data = orig_divs.get(sec)
-        if not o_data:
-            o_data = next((v for k, v in orig_divs.items() if v['cusip'] and v['cusip'] == c_data['cusip']), None)
-        
-        if not o_data:
-            msg = f"[NEW] Security added in current statement: {sec}"
-            discrepancies.append(msg)
-            diffs_csv_rows.append({
-                'C_Flagged': 'N/A', 'Change_Type': 'Added Security', 'Context': f"Security [{sec}]",
-                'Original_Value': 'None', 'Current_Value': 'Present'
-            })
-            print(f"{c_red}{msg}{c_res}")
-            continue
-            
-        for t_type, c_tot in c_data['totals'].items():
-            o_val = o_data['totals'].get(t_type, {'val': 0.0})['val']
-            log_diff(f"Div Total [{sec}] '{t_type}'", o_val, c_tot['val'], c_tot['c'])
-            
-        unmatched_orig = list(o_data['transactions'])
-        unmatched_curr = []
-        
-        for c_t in c_data['transactions']:
-            exact_match = next((t for t in unmatched_orig if t['date'] == c_t['date'] and t['type'] == c_t['type'] and abs(t['amount']['val'] - c_t['amount']['val']) < 0.001), None)
-            if exact_match:
-                unmatched_orig.remove(exact_match)
-            else:
-                unmatched_curr.append(c_t)
-                
-        still_unmatched_curr = []
-        orig_by_date = defaultdict(list)
-        for t in unmatched_orig: orig_by_date[t['date']].append(t)
-        curr_by_date = defaultdict(list)
-        for t in unmatched_curr: curr_by_date[t['date']].append(t)
-        
-        for date, c_txs in curr_by_date.items():
-            if date in orig_by_date:
-                o_txs = orig_by_date[date]
-                o_sum = sum(t['amount']['val'] for t in o_txs)
-                c_sum = sum(t['amount']['val'] for t in c_txs)
-                
-                if abs(o_sum - c_sum) < 0.02:
-                    any_c_flag = any(t['amount']['c'] for t in c_txs)
-                    flag_str = "[C-FLAGGED]" if any_c_flag else "[UNMARKED CHANGE]"
-                    
-                    o_desc = " + ".join([f"{t['type']} (${t['amount']['val']:.2f})" for t in o_txs])
-                    c_desc = " + ".join([f"{t['type']} (${t['amount']['val']:.2f})" for t in c_txs])
-                    
-                    msg = f"{flag_str} Recharacterized Div [{sec}] ({date}): Original: {o_desc} -> Current: {c_desc}"
-                    discrepancies.append(msg)
-                    diffs_csv_rows.append({
-                        'C_Flagged': 'Yes' if any_c_flag else 'No',
-                        'Change_Type': 'Recharacterization',
-                        'Context': f"Div [{sec}] ({date})",
-                        'Original_Value': o_desc,
-                        'Current_Value': c_desc
-                    })
-                    
-                    if not any_c_flag: print(f"{c_red}{msg}{c_res}")
-                    else: print(f"{c_yellow}{msg}{c_res}")
-                    
-                    for t in o_txs: unmatched_orig.remove(t)
-                else:
-                    still_unmatched_curr.extend(c_txs)
-            else:
-                still_unmatched_curr.extend(c_txs)
-                
-        unmatched_curr = still_unmatched_curr
-        still_unmatched_curr = []
-        
-        for c_t in unmatched_curr:
-            identity_match = next((t for t in unmatched_orig if t['date'] == c_t['date'] and t['type'] == c_t['type']), None)
-            if identity_match:
-                unmatched_orig.remove(identity_match)
-                log_diff(f"Div Tx [{sec}] ({c_t['date']} {c_t['type']})", identity_match['amount']['val'], c_t['amount']['val'], c_t['amount']['c'], "Modified Value")
-            else:
-                still_unmatched_curr.append(c_t)
-                
-        for c_t in still_unmatched_curr:
-            msg = f"[NEW] Div Tx [{sec}] added: {c_t['date']} {c_t['type']} ${c_t['amount']['val']:.2f}"
-            discrepancies.append(msg)
-            diffs_csv_rows.append({
-                'C_Flagged': 'Yes' if c_t['amount']['c'] else 'No',
-                'Change_Type': 'Added Transaction',
-                'Context': f"Div [{sec}] ({c_t['date']} {c_t['type']})",
-                'Original_Value': 'None',
-                'Current_Value': f"${c_t['amount']['val']:.2f}"
-            })
-            print(f"{c_red}{msg}{c_res}")
-            
-        for o_t in unmatched_orig:
-            msg = f"[REMOVED] Div Tx [{sec}] removed: {o_t['date']} {o_t['type']} ${o_t['amount']['val']:.2f}"
-            discrepancies.append(msg)
-            diffs_csv_rows.append({
-                'C_Flagged': 'N/A',
-                'Change_Type': 'Removed Transaction',
-                'Context': f"Div [{sec}] ({o_t['date']} {o_t['type']})",
-                'Original_Value': f"${o_t['amount']['val']:.2f}",
-                'Current_Value': 'None'
-            })
-            print(f"{c_red}{msg}{c_res}")
-
-    unmatched_orig_tx = list(orig_tx)
-    unmatched_curr_tx = []
-    
-    for c_t in curr_tx:
-        exact = next((t for t in unmatched_orig_tx if 
-            t['box'] == c_t['box'] and t['base_description'] == c_t['base_description'] and 
-            t['date_sold'] == c_t['date_sold'] and t['quantity']['val'] == c_t['quantity']['val'] and
-            t['proceeds']['val'] == c_t['proceeds']['val'] and t['cost_basis']['val'] == c_t['cost_basis']['val']
-        ), None)
-        if exact:
-            unmatched_orig_tx.remove(exact)
-        else:
-            unmatched_curr_tx.append(c_t)
-            
-    for c_t in unmatched_curr_tx:
-        identity_match = next((t for t in unmatched_orig_tx if 
-            t['box'] == c_t['box'] and t['base_description'] == c_t['base_description'] and 
-            t['date_sold'] == c_t['date_sold'] and t['quantity']['val'] == c_t['quantity']['val']
-        ), None)
-        
-        if identity_match:
-            unmatched_orig_tx.remove(identity_match)
-            ctx = f"1099-B Tx [{c_t['box']}] {c_t['base_description']} ({c_t['date_sold']})"
-            log_diff(f"{ctx} Proceeds", identity_match['proceeds']['val'], c_t['proceeds']['val'], c_t['proceeds']['c'])
-            log_diff(f"{ctx} Cost Basis", identity_match['cost_basis']['val'], c_t['cost_basis']['val'], c_t['cost_basis']['c'])
-            log_diff(f"{ctx} Adjustments", identity_match['adjustments']['val'], c_t['adjustments']['val'], c_t['adjustments']['c'])
-            log_diff(f"{ctx} Gain/Loss", identity_match['gain_loss']['val'], c_t['gain_loss']['val'], c_t['gain_loss']['c'])
-        else:
-            msg = f"[NEW] 1099-B Tx added: [{c_t['box']}] {c_t['base_description']} ({c_t['date_sold']}) Qty: {c_t['quantity']['val']:.4f}"
-            discrepancies.append(msg)
-            diffs_csv_rows.append({
-                'C_Flagged': 'Yes' if c_t['proceeds']['c'] else 'No',
-                'Change_Type': 'Added Transaction',
-                'Context': f"1099-B Tx [{c_t['box']}] {c_t['base_description']} ({c_t['date_sold']})",
-                'Original_Value': 'None',
-                'Current_Value': f"Qty: {c_t['quantity']['val']:.4f}"
-            })
-            print(f"{c_red}{msg}{c_res}")
-            
-    for o_t in unmatched_orig_tx:
-        msg = f"[REMOVED] 1099-B Tx removed: [{o_t['box']}] {o_t['base_description']} ({o_t['date_sold']}) Qty: {o_t['quantity']['val']:.4f}"
-        discrepancies.append(msg)
-        diffs_csv_rows.append({
-            'C_Flagged': 'N/A',
-            'Change_Type': 'Removed Transaction',
-            'Context': f"1099-B Tx [{o_t['box']}] {o_t['base_description']} ({o_t['date_sold']})",
-            'Original_Value': f"Qty: {o_t['quantity']['val']:.4f}",
-            'Current_Value': 'None'
-        })
-        print(f"{c_red}{msg}{c_res}")
-
-    try:
-        with open(log_path, 'w', encoding='utf-8') as f:
-            if discrepancies:
-                f.write("\n".join(discrepancies))
-            else:
-                f.write("No value discrepancies found between statements.\n")
-        print(f"{COLOR_CYAN}Comparison text log saved to: {log_path}{COLOR_RESET}")
-        
-        csv_log_path = log_path.replace('.txt', '.csv')
-        with open(csv_log_path, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=['C_Flagged', 'Change_Type', 'Context', 'Original_Value', 'Current_Value'])
-            writer.writeheader()
-            writer.writerows(diffs_csv_rows)
-        print(f"{COLOR_CYAN}Comparison CSV log saved to: {csv_log_path}{COLOR_RESET}")
-    except IOError: pass
-    
-    if not discrepancies:
-        print(f"{COLOR_GREEN}No value discrepancies found between statements.{COLOR_RESET}")
-        run_text_comparison(orig_pages, curr_pages, log_path, use_color)
+    if log_filepath and diff_log:
+        try:
+            with open(log_filepath, 'r+', encoding='utf-8') as f:
+                data = json.load(f)
+                data['comparison_diff'] = diff_log
+                f.seek(0)
+                json.dump(data, f, indent=2)
+                f.truncate()
+        except (IOError, json.JSONDecodeError): pass
 
 def prompt_for_missing_fed_pct(dividends_data, fed_csv_path, use_color=True):
     for sec_name, data in dividends_data.items():
         cusip = data.get('cusip', '')
-        if is_known_govt_fund(sec_name, cusip) and 'fed_pct' not in data['supplemental']:
+        
+        is_known = False
+        for k_cusip, k_name in KNOWN_GOVT_FUNDS.items():
+            if cusip.startswith(k_cusip) or sec_name.strip().upper().startswith(k_name):
+                is_known = True
+                break
+                
+        if is_known and 'fed_pct' not in data['supplemental']:
             c_y, c_res, c_g, c_r = (COLOR_YELLOW, COLOR_RESET, COLOR_GREEN, COLOR_RED) if use_color else ("", "", "", "")
             print(f"\n{c_y}[!] Supplemental information missing for:{c_res}\n    Security: {sec_name}\n    CUSIP   : {cusip}")
             while True:
@@ -830,25 +725,10 @@ def prompt_for_missing_fed_pct(dividends_data, fed_csv_path, use_color=True):
                     
                     if fed_csv_path:
                         try:
-                            fed_csv_data = {}
-                            if os.path.exists(fed_csv_path):
-                                with open(fed_csv_path, 'r', encoding='utf-8') as f:
-                                    reader = csv.DictReader(f)
-                                    if reader.fieldnames and "CUSIP or Description" in reader.fieldnames:
-                                        for row in reader:
-                                            key = row.get("CUSIP or Description", "").strip().upper()
-                                            v_str = row.get("Fed source percentage", "").strip()
-                                            if key and v_str:
-                                                fed_csv_data[key] = v_str
-                            
-                            save_key = cusip if cusip else sec_name.strip().upper()
-                            fed_csv_data[save_key] = val
-                            
-                            with open(fed_csv_path, 'w', newline='', encoding='utf-8') as f:
+                            with open(fed_csv_path, 'a', newline='', encoding='utf-8') as f:
                                 writer = csv.writer(f)
-                                writer.writerow(["CUSIP or Description", "Fed source percentage"])
-                                for k, v in fed_csv_data.items():
-                                    writer.writerow([k, v])
+                                save_key = cusip if cusip else sec_name
+                                writer.writerow([save_key, val])
                             print(f"{c_g}Saved '{save_key}' to '{fed_csv_path}' for future runs.{c_res}")
                         except IOError as e:
                             print(f"{c_r}Error saving to {fed_csv_path}: {e}{c_res}")
@@ -857,19 +737,19 @@ def prompt_for_missing_fed_pct(dividends_data, fed_csv_path, use_color=True):
 
 def perform_dividend_cross_checks(dividends_data, info_1099, prefix_str, use_color=True):
     print("\n--- Cross-Check vs Dividend & Tax-Exempt Summaries ---")
-    ov_divs = sum(d['totals'].get('Total Dividends & distributions', {'val':0.0})['val'] for d in dividends_data.values())
-    ov_exempt = sum(d['totals'].get('Total Tax-exempt dividends', {'val':0.0})['val'] for d in dividends_data.values())
+    ov_divs = sum(d['totals'].get('Total Dividends & distributions', 0.0) for d in dividends_data.values())
+    ov_exempt = sum(d['totals'].get('Total Tax-exempt dividends', 0.0) for d in dividends_data.values())
     
-    sum_div_f = info_1099['1a']['val'] + info_1099['2a']['val'] + info_1099['3']['val']
+    sum_div_f = info_1099['1a'] + info_1099['2a'] + info_1099['3']
     
-    grand_div = info_1099['grand_totals']['Total Dividends & distributions']['val']
-    grand_exempt = info_1099['grand_totals']['Total Tax-exempt dividends']['val']
+    grand_div = info_1099['grand_totals']['Total Dividends & distributions']
+    grand_exempt = info_1099['grand_totals']['Total Tax-exempt dividends']
     
     c_green, c_red, c_reset = (COLOR_GREEN, COLOR_RED, COLOR_RESET) if use_color else ("", "", "")
 
     for label, src1_label, s1, s2, s3, tag, file_suffix in [
         ("Total Dividends & distributions", "DIV 1a+2a+3", sum_div_f, ov_divs, grand_div, 'Total Dividends & distributions', 'dividends.csv'),
-        ("Total Tax-exempt dividends", "DIV 12", info_1099['12']['val'], ov_exempt, grand_exempt, 'Total Tax-exempt dividends', 'tax_exempt.csv')
+        ("Total Tax-exempt dividends", "DIV 12", info_1099['12'], ov_exempt, grand_exempt, 'Total Tax-exempt dividends', 'tax_exempt.csv')
     ]:
         print(f"\n[{label}]")
         print(f"  Source 1: {src1_label:<25} : {s1:>12.2f}")
@@ -890,8 +770,8 @@ def perform_dividend_cross_checks(dividends_data, info_1099, prefix_str, use_col
     print("\n------------------------------------------------------\n")
 
 def write_category_totals_csv(filename, dividends_data, target_key):
-    rows = [{'Security Name': k, 'CUSIP': v['cusip'], 'Amount': f"{v['totals'].get(target_key, {'val':0.0})['val']:.2f}"} for k, v in dividends_data.items() if v['totals'].get(target_key, {'val':0.0})['val'] != 0]
-    overall_total = sum(v['totals'].get(target_key, {'val':0.0})['val'] for v in dividends_data.values())
+    rows = [{'Security Name': k, 'CUSIP': v['cusip'], 'Amount': f"{v['totals'].get(target_key, 0.0):.2f}"} for k, v in dividends_data.items() if v['totals'].get(target_key, 0.0) != 0]
+    overall_total = sum(v['totals'].get(target_key, 0.0) for v in dividends_data.values())
     rows.append({'Security Name': 'OVERALL TOTAL', 'CUSIP': '', 'Amount': f"{overall_total:.2f}"})
     try:
         with open(filename, mode='w', newline='', encoding='utf-8') as f:
@@ -902,33 +782,54 @@ def write_category_totals_csv(filename, dividends_data, target_key):
     except IOError as e:
         print(f"    [!] Error writing {filename}: {e}")
 
-def write_supplemental_csvs(dividends_data, prefix_str):
-    for label, key, pct_key in [("us_securities_state_exempt_box20.csv", "Total Dividends & distributions", "fed_pct"), ("fed_exempt_state_exempt_box21.csv", "Total Tax-exempt dividends", "ny_pct")]:
-        rows = []
-        for k, v in dividends_data.items():
-            tot_val = v['totals'].get(key, {'val':0.0})['val']
-            if tot_val > 0 and v['supplemental'].get(pct_key) is not None:
-                rows.append({'Security Name': k, 'CUSIP': v['cusip'], 'Total Amount': f"{tot_val:.2f}", 'Percentage': f"{v['supplemental'][pct_key]*100:.2f}%", 'Calculated': f"{tot_val*v['supplemental'][pct_key]:.2f}"})
-        if rows:
-            filename = f"{prefix_str}{label}"
-            try:
-                with open(filename, mode='w', newline='', encoding='utf-8') as f:
-                    w = csv.DictWriter(f, fieldnames=['Security Name', 'CUSIP', 'Total Amount', 'Percentage', 'Calculated'])
-                    w.writeheader()
-                    w.writerows(rows)
-                    w.writerow({'Security Name': 'OVERALL TOTAL', 'CUSIP': '', 'Total Amount': f"{sum(float(r['Total Amount']) for r in rows):.2f}", 'Percentage': '', 'Calculated': f"{sum(float(r['Calculated']) for r in rows):.2f}"})
-                print(f"Created: {filename} ({len(rows)} securities)")
-            except IOError as e: print(f"Error writing {filename}: {e}")
+def write_supplemental_csvs(dividends_data, prefix_str, threshold=0.0):
+    fed_rows = []
+    for k, v in dividends_data.items():
+        tot_div = v['totals'].get("Total Dividends & distributions", 0.0)
+        fed_pct = v['supplemental'].get("fed_pct")
+        if tot_div > 0 and fed_pct is not None and (fed_pct * 100) >= threshold:
+            calc_div = tot_div * fed_pct
+            fed_rows.append({'Security Name': k, 'CUSIP': v['cusip'], 'Total Amount': f"{tot_div:.2f}", 'Percentage': f"{fed_pct*100:.2f}%", 'Calculated': f"{calc_div:.2f}"})
+            
+    if fed_rows:
+        filename = f"{prefix_str}us_securities_state_exempt_box20.csv"
+        try:
+            with open(filename, mode='w', newline='', encoding='utf-8') as f:
+                w = csv.DictWriter(f, fieldnames=['Security Name', 'CUSIP', 'Total Amount', 'Percentage', 'Calculated'])
+                w.writeheader()
+                w.writerows(fed_rows)
+                w.writerow({'Security Name': 'OVERALL TOTAL', 'CUSIP': '', 'Total Amount': f"{sum(float(r['Total Amount']) for r in fed_rows):.2f}", 'Percentage': '', 'Calculated': f"{sum(float(r['Calculated']) for r in fed_rows):.2f}"})
+            print(f"    [+] Created: {filename} ({len(fed_rows)} securities, >= {threshold}% threshold applied)")
+        except IOError as e: print(f"Error writing {filename}: {e}")
+
+    ny_rows = []
+    for k, v in dividends_data.items():
+        tot_exempt = v['totals'].get("Total Tax-exempt dividends", 0.0)
+        ny_pct = v['supplemental'].get("ny_pct")
+        if tot_exempt > 0 and ny_pct is not None:
+            calc_exempt = tot_exempt * ny_pct
+            ny_rows.append({'Security Name': k, 'CUSIP': v['cusip'], 'Total Amount': f"{tot_exempt:.2f}", 'Percentage': f"{ny_pct*100:.2f}%", 'Calculated': f"{calc_exempt:.2f}"})
+            
+    if ny_rows:
+        filename = f"{prefix_str}fed_exempt_state_exempt_box21.csv"
+        try:
+            with open(filename, mode='w', newline='', encoding='utf-8') as f:
+                w = csv.DictWriter(f, fieldnames=['Security Name', 'CUSIP', 'Total Amount', 'Percentage', 'Calculated'])
+                w.writeheader()
+                w.writerows(ny_rows)
+                w.writerow({'Security Name': 'OVERALL TOTAL', 'CUSIP': '', 'Total Amount': f"{sum(float(r['Total Amount']) for r in ny_rows):.2f}", 'Percentage': '', 'Calculated': f"{sum(float(r['Calculated']) for r in ny_rows):.2f}"})
+            print(f"    [+] Created: {filename} ({len(ny_rows)} securities)")
+        except IOError as e: print(f"Error writing {filename}: {e}")
 
 def cross_check(transactions, expected_summary, use_color=True):
     print("\n--- Cross-Check vs 1099-B Statement Summary ---")
     calculated = defaultdict(lambda: {'proceeds': 0.0, 'cost_basis': 0.0, 'adjustments': 0.0, 'gain_loss': 0.0})
     for tx in transactions:
         b = tx['box']
-        calculated[b]['proceeds'] += tx['proceeds']['val']
-        calculated[b]['cost_basis'] += tx['cost_basis']['val']
-        calculated[b]['adjustments'] += tx['adjustments']['val']
-        calculated[b]['gain_loss'] += tx['gain_loss']['val']
+        calculated[b]['proceeds'] += clean_num(tx['proceeds'])
+        calculated[b]['cost_basis'] += clean_num(tx['cost_basis'])
+        calculated[b]['adjustments'] += clean_num(tx['adjustments'])
+        calculated[b]['gain_loss'] += clean_num(tx['gain_loss'])
         
     all_match = True
     for box in [box for box in expected_summary.keys() if box in ['A', 'B', 'C', 'D', 'E', 'F']]:
@@ -936,12 +837,12 @@ def cross_check(transactions, expected_summary, use_color=True):
         calc = calculated[box]
         print(f"\nBox {box}:")
         for field in ['proceeds', 'cost_basis', 'adjustments', 'gain_loss']:
-            diff = abs(expected[field]['val'] - calc[field])
+            diff = abs(expected[field] - calc[field])
             if diff < 0.02: status = f"{COLOR_GREEN}MATCH{COLOR_RESET}" if use_color else "MATCH"
             else:
                 status = f"{COLOR_RED}MISMATCH (diff: {diff:.2f}){COLOR_RESET}" if use_color else f"MISMATCH (diff: {diff:.2f})"
                 all_match = False
-            print(f"  {field.capitalize():<12} | Expected: {expected[field]['val']:>10.2f} | Parsed: {calc[field]:>10.2f} | {status}")
+            print(f"  {field.capitalize():<12} | Expected: {expected[field]:>10.2f} | Parsed: {calc[field]:>10.2f} | {status}")
             
     print("\n-------------------------------------------------")
     if all_match: print(f"{COLOR_GREEN}SUCCESS: All parsed 1099-B totals match the statement summary.{COLOR_RESET}" if use_color else "SUCCESS: All parsed 1099-B totals match the statement summary.")
@@ -950,10 +851,11 @@ def cross_check(transactions, expected_summary, use_color=True):
 def main():
     parser = argparse.ArgumentParser(description="Parse Brokerage 1099-B and Dividend statements.")
     parser.add_argument("pdf", help="Path to the current 1099 PDF file.")
-    parser.add_argument("--original", type=str, help="Path to the original 1099 PDF file to compare against.")
+    parser.add_argument("--original", type=str, help="Path to the original (previous) 1099 PDF file to compare changes against.")
     parser.add_argument("--boxes", type=str, default="A,B,C,D,E,F", help="Comma-separated list of boxes to extract.")
     parser.add_argument("--output", type=str, default="1099b_data.csv", help="Output CSV filename for 1099-B data.")
     parser.add_argument("--fed-csv", type=str, help="Path to a CSV file containing Fed source percentage overrides.")
+    parser.add_argument("--box20-threshold", type=float, default=50.0, help="Minimum percentage (0-100) of Fed source income required to be included in the Box 20 CSV.")
     parser.add_argument("-d", "--debug", action="store_true", help="Enable debug logging to a categorized JSON file.")
     parser.add_argument("--log-file", type=str, default="parser_debug.json", help="Path for the debug log file.")
     args = parser.parse_args()
@@ -965,116 +867,136 @@ def main():
     clean_prefix = os.path.splitext(base_pdf_name)[0].replace('1099_', '').replace('1099', '').strip('_-')
     prefix_str = f"{clean_prefix}_" if clean_prefix else ""
     
-    actual_output_file, actual_log_file = f"{prefix_str}{args.output}", f"{prefix_str}{args.log_file}" if args.log_file else None
-    
-    color_log_file = f"{prefix_str}terminal_output_color.txt"
-    plain_log_file = f"{prefix_str}terminal_output_plain.txt"
-    
-    logger = DualLogger(color_log_file, plain_log_file)
+    original_stdout = sys.stdout
+    logger = MultiLogger(prefix_str)
     sys.stdout = logger
     
-    try:
-        default_fed_csv = "fed_percentages.csv"
-        fed_csv_path = args.fed_csv
-        
-        if fed_csv_path:
-            if not os.path.exists(fed_csv_path):
-                print(f"{COLOR_RED}[!] ERROR: The specified Fed percentage file '{fed_csv_path}' does not exist.{COLOR_RESET}")
-                sys.exit(1)
-            print(f"{COLOR_CYAN}Found manually specified Fed percentage file: {fed_csv_path}{COLOR_RESET}")
+    actual_output_file, actual_log_file = f"{prefix_str}{args.output}", f"{prefix_str}{args.log_file}" if args.log_file else None
+    
+    default_fed_csv = "fed_percentages.csv"
+    fed_csv_path = args.fed_csv
+    
+    if fed_csv_path:
+        if not os.path.exists(fed_csv_path):
+            print(f"{COLOR_RED}[!] ERROR: The specified Fed percentage file '{fed_csv_path}' does not exist.{COLOR_RESET}")
+            sys.stdout = original_stdout
+            logger.close()
+            sys.exit(1)
+        print(f"{COLOR_CYAN}Found manually specified Fed percentage file: {fed_csv_path}{COLOR_RESET}")
+    else:
+        if os.path.exists(default_fed_csv):
+            fed_csv_path = default_fed_csv
+            print(f"{COLOR_CYAN}Found default Fed percentage file: {default_fed_csv}{COLOR_RESET}")
         else:
-            if os.path.exists(default_fed_csv):
-                fed_csv_path = default_fed_csv
-                print(f"{COLOR_CYAN}Found default Fed percentage file: {default_fed_csv}{COLOR_RESET}")
-            else:
-                print(f"{COLOR_YELLOW}[!] Default Fed percentage file '{default_fed_csv}' not found. A template has been created at that path.{COLOR_RESET}")
-                try:
-                    with open(default_fed_csv, 'w', newline='', encoding='utf-8') as f:
-                        writer = csv.writer(f)
-                        writer.writerow(["CUSIP or Description", "Fed source percentage"])
-                except IOError as e:
-                    print(f"{COLOR_RED}Error creating template: {e}{COLOR_RESET}")
-                fed_csv_path = default_fed_csv 
-        
-        orig_transactions, orig_summary, orig_dividends, orig_info, orig_pages = [], {}, {}, {}, {}
-        if args.original:
-            if not os.path.exists(args.original):
-                print(f"{COLOR_RED}[!] ERROR: Original PDF '{args.original}' not found.{COLOR_RESET}")
-                sys.exit(1)
-            orig_transactions, orig_summary, orig_dividends, orig_info, orig_pages = parse_statement(
-                args.original, target_boxes, fed_csv_path=fed_csv_path, debug=False, use_color=use_color
-            )
-        
-        print(f"{COLOR_CYAN}Parsing Document: {args.pdf}{COLOR_RESET}")
-        transactions, expected_summary, dividends_data, info_1099, curr_pages = parse_statement(
-            args.pdf, target_boxes, fed_csv_path=fed_csv_path, debug=args.debug, log_filepath=actual_log_file if args.debug else None, use_color=use_color
-        )
-
-        if args.original:
-            compare_statements(transactions, info_1099, dividends_data, curr_pages, orig_transactions, orig_info, orig_dividends, orig_pages, f"{prefix_str}comparison_log.txt", use_color)
-
-        prompt_for_missing_fed_pct(dividends_data, fed_csv_path, use_color=use_color)
-
-        if transactions:
-            with open(actual_output_file, mode='w', newline='', encoding='utf-8') as csv_file:
-                writer = csv.DictWriter(csv_file, fieldnames=['box', 'description', 'date_sold', 'quantity', 'proceeds', 'date_acquired', 'cost_basis', 'adjustments', 'gain_loss'])
-                writer.writeheader()
-                for tx in transactions: 
-                    writer.writerow({k: (tx[k]['val'] if isinstance(tx[k], dict) else tx[k]) for k in ['box', 'description', 'date_sold', 'quantity', 'proceeds', 'date_acquired', 'cost_basis', 'adjustments', 'gain_loss']})
-            print(f"Created: {actual_output_file} ({len(transactions)} 1099-B transactions)")
-            
-            summary_1099b = defaultdict(lambda: {
-                'date_sold_set': set(), 'date_acquired_set': set(), 'base_desc_set': set(),
-                'quantity': 0.0, 'proceeds': 0.0, 'cost_basis': 0.0, 'adjustments': 0.0, 'gain_loss': 0.0
-            })
-            for tx in transactions:
-                b = tx['box']
-                summary_1099b[b]['date_sold_set'].add(tx['date_sold'])
-                summary_1099b[b]['date_acquired_set'].add(tx['date_acquired'])
-                summary_1099b[b]['base_desc_set'].add(tx['base_description'])
-                summary_1099b[b]['quantity'] += tx['quantity']['val']
-                summary_1099b[b]['proceeds'] += tx['proceeds']['val']
-                summary_1099b[b]['cost_basis'] += tx['cost_basis']['val']
-                summary_1099b[b]['adjustments'] += tx['adjustments']['val']
-                summary_1099b[b]['gain_loss'] += tx['gain_loss']['val']
-
-            summary_file = f"{prefix_str}1099b_summary.csv"
+            print(f"{COLOR_YELLOW}[!] Default Fed percentage file '{default_fed_csv}' not found. A template has been created at that path.{COLOR_RESET}")
             try:
-                with open(summary_file, mode='w', newline='', encoding='utf-8') as f:
-                    writer = csv.DictWriter(f, fieldnames=['box', 'description', 'date_sold', 'quantity', 'proceeds', 'date_acquired', 'cost_basis', 'adjustments', 'gain_loss'])
-                    writer.writeheader()
-                    for b in sorted(summary_1099b.keys()):
-                        data = summary_1099b[b]
-                        ds = list(data['date_sold_set'])[0] if len(data['date_sold_set']) == 1 else "VARIOUS"
-                        da = list(data['date_acquired_set'])[0] if len(data['date_acquired_set']) == 1 else "VARIOUS"
-                        
-                        if len(data['base_desc_set']) == 1:
-                            base_desc = list(data['base_desc_set'])[0]
-                            qty_sum_str = f"{data['quantity']:.4f}".rstrip('0').rstrip('.')
-                            desc = f"{qty_sum_str} {base_desc}"
-                        else:
-                            desc = "VARIOUS"
-
-                        writer.writerow({
-                            'box': b, 'description': desc, 'date_sold': ds, 'quantity': f"{data['quantity']:.4f}",
-                            'proceeds': f"{data['proceeds']:.2f}", 'date_acquired': da, 'cost_basis': f"{data['cost_basis']:.2f}",
-                            'adjustments': f"{data['adjustments']:.2f}", 'gain_loss': f"{data['gain_loss']:.2f}"
-                        })
-                print(f"    [+] Created: {summary_file} ({len(summary_1099b)} box summaries)")
+                with open(default_fed_csv, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["CUSIP or Description", "Fed source percentage"])
             except IOError as e:
-                print(f"Error writing {summary_file}: {e}")
-                
-            cross_check(transactions, expected_summary, use_color=use_color)
-                
-        else: print(f"{COLOR_YELLOW}No 1099-B transactions found.{COLOR_RESET}")
+                print(f"{COLOR_RED}Error creating template: {e}{COLOR_RESET}")
+            fed_csv_path = default_fed_csv 
+            
+    # ---------------------------------------------------------
+    # COMPARISON RUN BYPASS: This block strictly isolated.
+    # ---------------------------------------------------------
+    prev_info, prev_divs, prev_tx = None, None, None
+    if args.original:
+        if not os.path.exists(args.original):
+            print(f"{COLOR_RED}[!] ERROR: Original file '{args.original}' does not exist.{COLOR_RESET}")
+            sys.stdout = original_stdout
+            logger.close()
+            sys.exit(1)
+            
+        print(f"\n{COLOR_YELLOW}=== PARSING ORIGINAL STATEMENT FOR COMPARISON ==={COLOR_RESET}" if use_color else "\n=== PARSING ORIGINAL STATEMENT FOR COMPARISON ===")
+        prev_tx, _, prev_divs, prev_info, _ = parse_statement(
+            args.original, target_boxes, fed_csv_path=fed_csv_path, debug=False, log_filepath=None, use_color=use_color, is_comparison=True
+        )
+    # ---------------------------------------------------------
+    
+    transactions, expected_summary, dividends_data, info_1099, c_flags = parse_statement(
+        args.pdf, target_boxes, fed_csv_path=fed_csv_path, debug=args.debug, log_filepath=actual_log_file if args.debug else None, use_color=use_color
+    )
 
-        if dividends_data:
-            perform_dividend_cross_checks(dividends_data, info_1099, prefix_str, use_color=use_color)
-            write_supplemental_csvs(dividends_data, prefix_str)
+    print_corrected_items(c_flags, transactions, dividends_data, use_color=use_color)
+    
+    # Strictly isolated doc comparison block
+    if args.original:
+        compare_statements(prev_info, prev_divs, prev_tx, info_1099, dividends_data, transactions, p_path=args.original, c_path=args.pdf, prefix_str=prefix_str, correction_flags=c_flags, log_filepath=actual_log_file if args.debug else None, use_color=use_color)
 
-    finally:
-        sys.stdout = logger.terminal
-        logger.close()
+    prompt_for_missing_fed_pct(dividends_data, fed_csv_path, use_color=use_color)
+
+    if transactions:
+        with open(actual_output_file, mode='w', newline='', encoding='utf-8') as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=['box', 'description', 'date_sold', 'quantity', 'proceeds', 'date_acquired', 'cost_basis', 'adjustments', 'gain_loss'])
+            writer.writeheader()
+            for tx in transactions: writer.writerow({k: tx.get(k, '') for k in ['box', 'description', 'date_sold', 'quantity', 'proceeds', 'date_acquired', 'cost_basis', 'adjustments', 'gain_loss']})
+        print(f"\nCreated: {actual_output_file} ({len(transactions)} 1099-B transactions)")
+        cross_check(transactions, expected_summary, use_color=use_color)
+        
+        summary_1099b = defaultdict(lambda: {
+            'date_sold_set': set(),
+            'date_acquired_set': set(),
+            'base_desc_set': set(),
+            'quantity': 0.0,
+            'proceeds': 0.0,
+            'cost_basis': 0.0,
+            'adjustments': 0.0,
+            'gain_loss': 0.0
+        })
+        for tx in transactions:
+            b = tx['box']
+            summary_1099b[b]['date_sold_set'].add(tx['date_sold'])
+            summary_1099b[b]['date_acquired_set'].add(tx['date_acquired'])
+            summary_1099b[b]['base_desc_set'].add(tx['base_description'])
+            summary_1099b[b]['quantity'] += clean_num(tx['quantity'])
+            summary_1099b[b]['proceeds'] += clean_num(tx['proceeds'])
+            summary_1099b[b]['cost_basis'] += clean_num(tx['cost_basis'])
+            summary_1099b[b]['adjustments'] += clean_num(tx['adjustments'])
+            summary_1099b[b]['gain_loss'] += clean_num(tx['gain_loss'])
+
+        summary_file = f"{prefix_str}1099b_summary.csv"
+        try:
+            with open(summary_file, mode='w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=['box', 'description', 'date_sold', 'quantity', 'proceeds', 'date_acquired', 'cost_basis', 'adjustments', 'gain_loss'])
+                writer.writeheader()
+                for b in sorted(summary_1099b.keys()):
+                    data = summary_1099b[b]
+                    ds = list(data['date_sold_set'])[0] if len(data['date_sold_set']) == 1 else "VARIOUS"
+                    da = list(data['date_acquired_set'])[0] if len(data['date_acquired_set']) == 1 else "VARIOUS"
+                    
+                    if len(data['base_desc_set']) == 1:
+                        base_desc = list(data['base_desc_set'])[0]
+                        qty_sum_str = f"{data['quantity']:.4f}".rstrip('0').rstrip('.')
+                        desc = f"{qty_sum_str} {base_desc}"
+                    else:
+                        desc = "VARIOUS"
+
+                    writer.writerow({
+                        'box': b,
+                        'description': desc,
+                        'date_sold': ds,
+                        'quantity': f"{data['quantity']:.4f}",
+                        'proceeds': f"{data['proceeds']:.2f}",
+                        'date_acquired': da,
+                        'cost_basis': f"{data['cost_basis']:.2f}",
+                        'adjustments': f"{data['adjustments']:.2f}",
+                        'gain_loss': f"{data['gain_loss']:.2f}"
+                    })
+            print(f"    [+] Created: {summary_file} ({len(summary_1099b)} box summaries)")
+        except IOError as e:
+            print(f"Error writing {summary_file}: {e}")
+            
+    else: print(f"{COLOR_YELLOW}No 1099-B transactions found.{COLOR_RESET}")
+
+    if dividends_data:
+        perform_dividend_cross_checks(dividends_data, info_1099, prefix_str, use_color=use_color)
+        write_supplemental_csvs(dividends_data, prefix_str, threshold=args.box20_threshold)
+        
+    print(f"\n{COLOR_CYAN}Terminal output additionally logged to: {prefix_str}console_output.txt and {prefix_str}console_output_color.txt{COLOR_RESET}")
+    
+    sys.stdout = original_stdout
+    logger.close()
 
 if __name__ == "__main__":
     main()
