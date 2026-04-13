@@ -21,6 +21,47 @@ COLOR_YELLOW = '\033[93m'
 COLOR_CYAN = '\033[96m'
 COLOR_RESET = '\033[0m'
 
+# Dictionary of funds known to hold US Government obligations. 
+# Used to prompt the user if percentages are completely missing from both the PDF and the CSV,
+# and to bypass strict 9-character CUSIP validation for non-standard internal IDs.
+KNOWN_GOVT_FUNDS = [
+    {'sec_name': 'VANGUARD FEDL MONEY MKT', 'cusip': '9999100'}
+]
+
+def is_known_govt_fund(sec_name, cusip):
+    """Checks if a parsed security matches any known government fund profiles."""
+    sec_name_upper = sec_name.strip().upper()
+    cusip_upper = cusip.strip().upper()
+    for fund in KNOWN_GOVT_FUNDS:
+        if fund.get('sec_name') and sec_name_upper.startswith(fund['sec_name'].upper()):
+            return True
+        if fund.get('cusip') and cusip_upper.startswith(fund['cusip'].upper()):
+            return True
+    return False
+
+class DualLogger:
+    """Intercepts sys.stdout to write to the terminal, a color log, and a plain text log simultaneously."""
+    def __init__(self, color_log_path, plain_log_path):
+        self.terminal = sys.stdout
+        self.color_log = open(color_log_path, 'w', encoding='utf-8')
+        self.plain_log = open(plain_log_path, 'w', encoding='utf-8')
+        self.ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.color_log.write(message)
+        self.plain_log.write(self.ansi_escape.sub('', message))
+
+    def flush(self):
+        self.terminal.flush()
+        self.color_log.flush()
+        self.plain_log.flush()
+        
+    def close(self):
+        self.color_log.close()
+        self.plain_log.close()
+
+
 def parse_val_and_c(val_str):
     """Parses a string into a float and detects if it has a 'C' (Corrected) flag."""
     if not val_str or val_str == '...': 
@@ -298,7 +339,7 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
                                 alpha_match = re.match(r'^([A-Z0-9]{9})\b', raw_cusip, re.IGNORECASE)
                                 if alpha_match:
                                     is_new_sec, cusip, name = True, alpha_match.group(1).upper(), parts[0].strip()
-                                elif raw_cusip.startswith("9999100"):
+                                elif is_known_govt_fund(parts[0].strip(), raw_cusip):
                                     alpha_match = re.match(r'^([A-Z0-9]+)', raw_cusip, re.IGNORECASE)
                                     is_new_sec, cusip, name = True, alpha_match.group(1).upper() if alpha_match else raw_cusip.upper(), parts[0].strip()
                         
@@ -392,10 +433,35 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
             if supp['fed_pct'] is not None: dividends_data[matched_sec]['supplemental']['fed_pct'] = supp['fed_pct']
             if supp['ny_pct'] is not None: dividends_data[matched_sec]['supplemental']['ny_pct'] = supp['ny_pct']
 
-    if fed_csv_data:
-        for k, v in dividends_data.items():
-            override = fed_csv_data.get(v['cusip']) or fed_csv_data.get(k.upper()) or next((ov for mk, ov in fed_csv_data.items() if k.upper().startswith(mk)), None)
-            if override is not None: v['supplemental']['fed_pct'] = override
+    csv_needs_update = False
+    if fed_csv_path:
+        for sec_name, data in dividends_data.items():
+            cusip = data.get('cusip', '')
+            pdf_fed_pct = data['supplemental'].get('fed_pct')
+            save_key = cusip if cusip else sec_name.strip().upper()
+
+            if pdf_fed_pct is not None:
+                csv_val = fed_csv_data.get(save_key)
+                if csv_val is None or abs(csv_val - pdf_fed_pct) > 0.0001:
+                    fed_csv_data[save_key] = pdf_fed_pct
+                    csv_needs_update = True
+            else:
+                override = fed_csv_data.get(cusip) or fed_csv_data.get(sec_name.strip().upper()) or next((ov for mk, ov in fed_csv_data.items() if sec_name.strip().upper().startswith(mk)), None)
+                if override is not None:
+                    data['supplemental']['fed_pct'] = override
+
+        if csv_needs_update:
+            try:
+                with open(fed_csv_path, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["CUSIP or Description", "Fed source percentage"])
+                    for k, v in fed_csv_data.items():
+                        pct_str = f"{v * 100:.6f}".rstrip('0').rstrip('.')
+                        if pct_str == '': pct_str = '0'
+                        writer.writerow([k, pct_str])
+                cprint(f"[+] Updated {fed_csv_path} with primary values extracted from PDF.", COLOR_GREEN)
+            except IOError as e:
+                cprint(f"[!] Error updating {fed_csv_path}: {e}", COLOR_RED)
 
     if debug and log_filepath:
         try:
@@ -724,7 +790,7 @@ def compare_statements(curr_tx, curr_info, curr_divs, curr_pages, orig_tx, orig_
 def prompt_for_missing_fed_pct(dividends_data, fed_csv_path, use_color=True):
     for sec_name, data in dividends_data.items():
         cusip = data.get('cusip', '')
-        if (sec_name.strip().upper().startswith("VANGUARD FEDL MONEY MKT") or cusip.startswith("9999100")) and 'fed_pct' not in data['supplemental']:
+        if is_known_govt_fund(sec_name, cusip) and 'fed_pct' not in data['supplemental']:
             c_y, c_res, c_g, c_r = (COLOR_YELLOW, COLOR_RESET, COLOR_GREEN, COLOR_RED) if use_color else ("", "", "", "")
             print(f"\n{c_y}[!] Supplemental information missing for:{c_res}\n    Security: {sec_name}\n    CUSIP   : {cusip}")
             while True:
@@ -737,10 +803,25 @@ def prompt_for_missing_fed_pct(dividends_data, fed_csv_path, use_color=True):
                     
                     if fed_csv_path:
                         try:
-                            with open(fed_csv_path, 'a', newline='', encoding='utf-8') as f:
+                            fed_csv_data = {}
+                            if os.path.exists(fed_csv_path):
+                                with open(fed_csv_path, 'r', encoding='utf-8') as f:
+                                    reader = csv.DictReader(f)
+                                    if reader.fieldnames and "CUSIP or Description" in reader.fieldnames:
+                                        for row in reader:
+                                            key = row.get("CUSIP or Description", "").strip().upper()
+                                            v_str = row.get("Fed source percentage", "").strip()
+                                            if key and v_str:
+                                                fed_csv_data[key] = v_str
+                            
+                            save_key = cusip if cusip else sec_name.strip().upper()
+                            fed_csv_data[save_key] = val
+                            
+                            with open(fed_csv_path, 'w', newline='', encoding='utf-8') as f:
                                 writer = csv.writer(f)
-                                save_key = cusip if cusip else sec_name
-                                writer.writerow([save_key, val])
+                                writer.writerow(["CUSIP or Description", "Fed source percentage"])
+                                for k, v in fed_csv_data.items():
+                                    writer.writerow([k, v])
                             print(f"{c_g}Saved '{save_key}' to '{fed_csv_path}' for future runs.{c_res}")
                         except IOError as e:
                             print(f"{c_r}Error saving to {fed_csv_path}: {e}{c_res}")
@@ -859,103 +940,114 @@ def main():
     
     actual_output_file, actual_log_file = f"{prefix_str}{args.output}", f"{prefix_str}{args.log_file}" if args.log_file else None
     
-    default_fed_csv = "fed_percentages.csv"
-    fed_csv_path = args.fed_csv
+    color_log_file = f"{prefix_str}terminal_output_color.txt"
+    plain_log_file = f"{prefix_str}terminal_output_plain.txt"
     
-    if fed_csv_path:
-        if not os.path.exists(fed_csv_path):
-            print(f"{COLOR_RED}[!] ERROR: The specified Fed percentage file '{fed_csv_path}' does not exist.{COLOR_RESET}")
-            sys.exit(1)
-        print(f"{COLOR_CYAN}Found manually specified Fed percentage file: {fed_csv_path}{COLOR_RESET}")
-    else:
-        if os.path.exists(default_fed_csv):
-            fed_csv_path = default_fed_csv
-            print(f"{COLOR_CYAN}Found default Fed percentage file: {default_fed_csv}{COLOR_RESET}")
-        else:
-            print(f"{COLOR_YELLOW}[!] Default Fed percentage file '{default_fed_csv}' not found. A template has been created at that path.{COLOR_RESET}")
-            try:
-                with open(default_fed_csv, 'w', newline='', encoding='utf-8') as f:
-                    writer = csv.writer(f)
-                    writer.writerow(["CUSIP or Description", "Fed source percentage"])
-            except IOError as e:
-                print(f"{COLOR_RED}Error creating template: {e}{COLOR_RESET}")
-            fed_csv_path = default_fed_csv 
+    logger = DualLogger(color_log_file, plain_log_file)
+    sys.stdout = logger
     
-    orig_transactions, orig_summary, orig_dividends, orig_info, orig_pages = [], {}, {}, {}, {}
-    if args.original:
-        if not os.path.exists(args.original):
-            print(f"{COLOR_RED}[!] ERROR: Original PDF '{args.original}' not found.{COLOR_RESET}")
-            sys.exit(1)
-        orig_transactions, orig_summary, orig_dividends, orig_info, orig_pages = parse_statement(
-            args.original, target_boxes, fed_csv_path=fed_csv_path, debug=False, use_color=use_color
-        )
-    
-    print(f"{COLOR_CYAN}Parsing Document: {args.pdf}{COLOR_RESET}")
-    transactions, expected_summary, dividends_data, info_1099, curr_pages = parse_statement(
-        args.pdf, target_boxes, fed_csv_path=fed_csv_path, debug=args.debug, log_filepath=actual_log_file if args.debug else None, use_color=use_color
-    )
-
-    if args.original:
-        compare_statements(transactions, info_1099, dividends_data, curr_pages, orig_transactions, orig_info, orig_dividends, orig_pages, f"{prefix_str}comparison_log.txt", use_color)
-
-    prompt_for_missing_fed_pct(dividends_data, fed_csv_path, use_color=use_color)
-
-    if transactions:
-        with open(actual_output_file, mode='w', newline='', encoding='utf-8') as csv_file:
-            writer = csv.DictWriter(csv_file, fieldnames=['box', 'description', 'date_sold', 'quantity', 'proceeds', 'date_acquired', 'cost_basis', 'adjustments', 'gain_loss'])
-            writer.writeheader()
-            for tx in transactions: 
-                writer.writerow({k: (tx[k]['val'] if isinstance(tx[k], dict) else tx[k]) for k in ['box', 'description', 'date_sold', 'quantity', 'proceeds', 'date_acquired', 'cost_basis', 'adjustments', 'gain_loss']})
-        print(f"Created: {actual_output_file} ({len(transactions)} 1099-B transactions)")
+    try:
+        default_fed_csv = "fed_percentages.csv"
+        fed_csv_path = args.fed_csv
         
-        summary_1099b = defaultdict(lambda: {
-            'date_sold_set': set(), 'date_acquired_set': set(), 'base_desc_set': set(),
-            'quantity': 0.0, 'proceeds': 0.0, 'cost_basis': 0.0, 'adjustments': 0.0, 'gain_loss': 0.0
-        })
-        for tx in transactions:
-            b = tx['box']
-            summary_1099b[b]['date_sold_set'].add(tx['date_sold'])
-            summary_1099b[b]['date_acquired_set'].add(tx['date_acquired'])
-            summary_1099b[b]['base_desc_set'].add(tx['base_description'])
-            summary_1099b[b]['quantity'] += tx['quantity']['val']
-            summary_1099b[b]['proceeds'] += tx['proceeds']['val']
-            summary_1099b[b]['cost_basis'] += tx['cost_basis']['val']
-            summary_1099b[b]['adjustments'] += tx['adjustments']['val']
-            summary_1099b[b]['gain_loss'] += tx['gain_loss']['val']
+        if fed_csv_path:
+            if not os.path.exists(fed_csv_path):
+                print(f"{COLOR_RED}[!] ERROR: The specified Fed percentage file '{fed_csv_path}' does not exist.{COLOR_RESET}")
+                sys.exit(1)
+            print(f"{COLOR_CYAN}Found manually specified Fed percentage file: {fed_csv_path}{COLOR_RESET}")
+        else:
+            if os.path.exists(default_fed_csv):
+                fed_csv_path = default_fed_csv
+                print(f"{COLOR_CYAN}Found default Fed percentage file: {default_fed_csv}{COLOR_RESET}")
+            else:
+                print(f"{COLOR_YELLOW}[!] Default Fed percentage file '{default_fed_csv}' not found. A template has been created at that path.{COLOR_RESET}")
+                try:
+                    with open(default_fed_csv, 'w', newline='', encoding='utf-8') as f:
+                        writer = csv.writer(f)
+                        writer.writerow(["CUSIP or Description", "Fed source percentage"])
+                except IOError as e:
+                    print(f"{COLOR_RED}Error creating template: {e}{COLOR_RESET}")
+                fed_csv_path = default_fed_csv 
+        
+        orig_transactions, orig_summary, orig_dividends, orig_info, orig_pages = [], {}, {}, {}, {}
+        if args.original:
+            if not os.path.exists(args.original):
+                print(f"{COLOR_RED}[!] ERROR: Original PDF '{args.original}' not found.{COLOR_RESET}")
+                sys.exit(1)
+            orig_transactions, orig_summary, orig_dividends, orig_info, orig_pages = parse_statement(
+                args.original, target_boxes, fed_csv_path=fed_csv_path, debug=False, use_color=use_color
+            )
+        
+        print(f"{COLOR_CYAN}Parsing Document: {args.pdf}{COLOR_RESET}")
+        transactions, expected_summary, dividends_data, info_1099, curr_pages = parse_statement(
+            args.pdf, target_boxes, fed_csv_path=fed_csv_path, debug=args.debug, log_filepath=actual_log_file if args.debug else None, use_color=use_color
+        )
 
-        summary_file = f"{prefix_str}1099b_summary.csv"
-        try:
-            with open(summary_file, mode='w', newline='', encoding='utf-8') as f:
-                writer = csv.DictWriter(f, fieldnames=['box', 'description', 'date_sold', 'quantity', 'proceeds', 'date_acquired', 'cost_basis', 'adjustments', 'gain_loss'])
+        if args.original:
+            compare_statements(transactions, info_1099, dividends_data, curr_pages, orig_transactions, orig_info, orig_dividends, orig_pages, f"{prefix_str}comparison_log.txt", use_color)
+
+        prompt_for_missing_fed_pct(dividends_data, fed_csv_path, use_color=use_color)
+
+        if transactions:
+            with open(actual_output_file, mode='w', newline='', encoding='utf-8') as csv_file:
+                writer = csv.DictWriter(csv_file, fieldnames=['box', 'description', 'date_sold', 'quantity', 'proceeds', 'date_acquired', 'cost_basis', 'adjustments', 'gain_loss'])
                 writer.writeheader()
-                for b in sorted(summary_1099b.keys()):
-                    data = summary_1099b[b]
-                    ds = list(data['date_sold_set'])[0] if len(data['date_sold_set']) == 1 else "VARIOUS"
-                    da = list(data['date_acquired_set'])[0] if len(data['date_acquired_set']) == 1 else "VARIOUS"
-                    
-                    if len(data['base_desc_set']) == 1:
-                        base_desc = list(data['base_desc_set'])[0]
-                        qty_sum_str = f"{data['quantity']:.4f}".rstrip('0').rstrip('.')
-                        desc = f"{qty_sum_str} {base_desc}"
-                    else:
-                        desc = "VARIOUS"
-
-                    writer.writerow({
-                        'box': b, 'description': desc, 'date_sold': ds, 'quantity': f"{data['quantity']:.4f}",
-                        'proceeds': f"{data['proceeds']:.2f}", 'date_acquired': da, 'cost_basis': f"{data['cost_basis']:.2f}",
-                        'adjustments': f"{data['adjustments']:.2f}", 'gain_loss': f"{data['gain_loss']:.2f}"
-                    })
-            print(f"    [+] Created: {summary_file} ({len(summary_1099b)} box summaries)")
-        except IOError as e:
-            print(f"Error writing {summary_file}: {e}")
+                for tx in transactions: 
+                    writer.writerow({k: (tx[k]['val'] if isinstance(tx[k], dict) else tx[k]) for k in ['box', 'description', 'date_sold', 'quantity', 'proceeds', 'date_acquired', 'cost_basis', 'adjustments', 'gain_loss']})
+            print(f"Created: {actual_output_file} ({len(transactions)} 1099-B transactions)")
             
-        cross_check(transactions, expected_summary, use_color=use_color)
-            
-    else: print(f"{COLOR_YELLOW}No 1099-B transactions found.{COLOR_RESET}")
+            summary_1099b = defaultdict(lambda: {
+                'date_sold_set': set(), 'date_acquired_set': set(), 'base_desc_set': set(),
+                'quantity': 0.0, 'proceeds': 0.0, 'cost_basis': 0.0, 'adjustments': 0.0, 'gain_loss': 0.0
+            })
+            for tx in transactions:
+                b = tx['box']
+                summary_1099b[b]['date_sold_set'].add(tx['date_sold'])
+                summary_1099b[b]['date_acquired_set'].add(tx['date_acquired'])
+                summary_1099b[b]['base_desc_set'].add(tx['base_description'])
+                summary_1099b[b]['quantity'] += tx['quantity']['val']
+                summary_1099b[b]['proceeds'] += tx['proceeds']['val']
+                summary_1099b[b]['cost_basis'] += tx['cost_basis']['val']
+                summary_1099b[b]['adjustments'] += tx['adjustments']['val']
+                summary_1099b[b]['gain_loss'] += tx['gain_loss']['val']
 
-    if dividends_data:
-        perform_dividend_cross_checks(dividends_data, info_1099, prefix_str, use_color=use_color)
-        write_supplemental_csvs(dividends_data, prefix_str)
+            summary_file = f"{prefix_str}1099b_summary.csv"
+            try:
+                with open(summary_file, mode='w', newline='', encoding='utf-8') as f:
+                    writer = csv.DictWriter(f, fieldnames=['box', 'description', 'date_sold', 'quantity', 'proceeds', 'date_acquired', 'cost_basis', 'adjustments', 'gain_loss'])
+                    writer.writeheader()
+                    for b in sorted(summary_1099b.keys()):
+                        data = summary_1099b[b]
+                        ds = list(data['date_sold_set'])[0] if len(data['date_sold_set']) == 1 else "VARIOUS"
+                        da = list(data['date_acquired_set'])[0] if len(data['date_acquired_set']) == 1 else "VARIOUS"
+                        
+                        if len(data['base_desc_set']) == 1:
+                            base_desc = list(data['base_desc_set'])[0]
+                            qty_sum_str = f"{data['quantity']:.4f}".rstrip('0').rstrip('.')
+                            desc = f"{qty_sum_str} {base_desc}"
+                        else:
+                            desc = "VARIOUS"
+
+                        writer.writerow({
+                            'box': b, 'description': desc, 'date_sold': ds, 'quantity': f"{data['quantity']:.4f}",
+                            'proceeds': f"{data['proceeds']:.2f}", 'date_acquired': da, 'cost_basis': f"{data['cost_basis']:.2f}",
+                            'adjustments': f"{data['adjustments']:.2f}", 'gain_loss': f"{data['gain_loss']:.2f}"
+                        })
+                print(f"    [+] Created: {summary_file} ({len(summary_1099b)} box summaries)")
+            except IOError as e:
+                print(f"Error writing {summary_file}: {e}")
+                
+            cross_check(transactions, expected_summary, use_color=use_color)
+                
+        else: print(f"{COLOR_YELLOW}No 1099-B transactions found.{COLOR_RESET}")
+
+        if dividends_data:
+            perform_dividend_cross_checks(dividends_data, info_1099, prefix_str, use_color=use_color)
+            write_supplemental_csvs(dividends_data, prefix_str)
+
+    finally:
+        sys.stdout = logger.terminal
+        logger.close()
 
 if __name__ == "__main__":
     main()
