@@ -5,6 +5,7 @@ import re
 import sys
 import json
 import os
+import difflib
 from collections import defaultdict
 
 try:
@@ -46,6 +47,7 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
     transactions = []
     summary_expected = {}
     supplemental_extracted = []
+    raw_pages = {}
     
     info_1099 = {
         '1a': {'val': 0.0, 'c': False}, '1b': {'val': 0.0, 'c': False}, 
@@ -144,6 +146,8 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
                     sys.exit(1)
                 
                 if not page_text: continue
+                
+                raw_pages[f"page_{page_num + 1}"] = page_text
                 if debug: debug_log["raw_pages"][f"page_{page_num + 1}"] = page_text
                 
                 if "1099-DIV" in page_text.upper():
@@ -398,9 +402,120 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
             with open(log_filepath, 'w', encoding='utf-8') as f: json.dump(debug_log, f, indent=2)
         except IOError: pass
 
-    return transactions, summary_expected, dividends_data, info_1099
+    return transactions, summary_expected, dividends_data, info_1099, raw_pages
 
-def compare_statements(curr_tx, curr_info, curr_divs, orig_tx, orig_info, orig_divs, log_path, use_color=True):
+def run_text_comparison(orig_pages, curr_pages, log_path, use_color):
+    c_cyan = COLOR_CYAN if use_color else ""
+    c_res = COLOR_RESET if use_color else ""
+    c_red = COLOR_RED if use_color else ""
+    c_green = COLOR_GREEN if use_color else ""
+    c_yellow = COLOR_YELLOW if use_color else ""
+    
+    print(f"\n{c_cyan}--- Running General Text Comparison ---{c_res}")
+    
+    def find_statement_date(pages):
+        for i in range(1, len(pages) + 1):
+            text = pages.get(f"page_{i}", "")
+            m = re.search(r'Statement Date:\s*(\d{2}/\d{2}/\d{4})', text, re.IGNORECASE)
+            if m: return m.group(1)
+        return "Unknown"
+        
+    orig_date = find_statement_date(orig_pages)
+    curr_date = find_statement_date(curr_pages)
+    
+    orig_date_pattern = r'\b' + re.escape(orig_date) + r'\b' if orig_date != "Unknown" else r'\b\d{2}/\d{2}/\d{4}\b'
+    curr_date_pattern = r'\b' + re.escape(curr_date) + r'\b' if curr_date != "Unknown" else r'\b\d{2}/\d{2}/\d{4}\b'
+    
+    other_diffs = []
+    header_pages = []
+    
+    max_pages = max(len(orig_pages), len(curr_pages))
+    for page_num in range(1, max_pages + 1):
+        o_text = orig_pages.get(f"page_{page_num}", "")
+        c_text = curr_pages.get(f"page_{page_num}", "")
+        
+        o_lines = [re.sub(r'\s+', ' ', l).strip() for l in o_text.split('\n') if l.strip()]
+        c_lines = [re.sub(r'\s+', ' ', l).strip() for l in c_text.split('\n') if l.strip()]
+        
+        sm = difflib.SequenceMatcher(None, o_lines, c_lines)
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag == 'equal': continue
+            
+            o_chunk = o_lines[i1:i2]
+            c_chunk = c_lines[j1:j2]
+            
+            clean_o = " ".join(o_chunk)
+            clean_o = re.sub(orig_date_pattern, '', clean_o)
+            clean_o = re.sub(r'\bCORRECTED\b', '', clean_o, flags=re.IGNORECASE)
+            clean_o = re.sub(r'\s+', ' ', clean_o).strip()
+            
+            clean_c = " ".join(c_chunk)
+            clean_c = re.sub(curr_date_pattern, '', clean_c)
+            clean_c = re.sub(r'\bCORRECTED\b', '', clean_c, flags=re.IGNORECASE)
+            clean_c = re.sub(r'\s+', ' ', clean_c).strip()
+            
+            if clean_o == clean_c:
+                if page_num not in header_pages:
+                    header_pages.append(page_num)
+            else:
+                context = o_lines[max(0, i1-1):i1]
+                other_diffs.append({
+                    'page': page_num,
+                    'removed': o_chunk,
+                    'added': c_chunk,
+                    'context': context
+                })
+                
+    log_entries = []
+    if not other_diffs and header_pages:
+        msg1 = "The only textual difference between the documents is the Statement Date and/or the 'CORRECTED' label."
+        msg2 = f"Original Date: {orig_date} -> Current Date: {curr_date}"
+        msg3 = f"This change was detected on pages: {', '.join(map(str, header_pages))}"
+        print(f"{c_green}{msg1}\n{msg2}\n{msg3}{c_res}")
+        log_entries.extend([msg1, msg2, msg3])
+    elif not other_diffs and not header_pages:
+        msg = "The documents are textually identical."
+        print(f"{c_green}{msg}{c_res}")
+        log_entries.append(msg)
+    else:
+        msg = "Found unstructured text differences between the documents:"
+        print(f"{c_yellow}{msg}{c_res}")
+        log_entries.append(msg)
+        
+        if header_pages:
+            h_msg = f"  - Statement Date changed (Original: {orig_date} -> Current: {curr_date}) and/or 'CORRECTED' status modified on pages: {', '.join(map(str, header_pages))}"
+            print(f"{c_yellow}{h_msg}{c_res}")
+            log_entries.append(h_msg)
+            
+        for diff in other_diffs:
+            p_msg = f"\nPage {diff['page']}:"
+            print(f"{c_cyan}{p_msg}{c_res}")
+            log_entries.append(p_msg)
+            
+            if diff['context']:
+                c_msg = f"  Context: \"{diff['context'][0]}\""
+                print(c_msg)
+                log_entries.append(c_msg)
+                
+            for r in diff['removed']:
+                r_msg = f"  - {r}"
+                print(f"{c_red}{r_msg}{c_res}")
+                log_entries.append(r_msg)
+                
+            for a in diff['added']:
+                a_msg = f"  + {a}"
+                print(f"{c_green}{a_msg}{c_res}")
+                log_entries.append(a_msg)
+                
+    try:
+        with open(log_path, 'a', encoding='utf-8') as f:
+            f.write("\n\n--- General Text Comparison ---\n")
+            f.write("\n".join(log_entries))
+        print(f"{c_cyan}General text comparison appended to: {log_path}{c_res}")
+    except IOError:
+        pass
+
+def compare_statements(curr_tx, curr_info, curr_divs, curr_pages, orig_tx, orig_info, orig_divs, orig_pages, log_path, use_color=True):
     c_red = COLOR_RED if use_color else ""
     c_yellow = COLOR_YELLOW if use_color else ""
     c_res = COLOR_RESET if use_color else ""
@@ -455,7 +570,6 @@ def compare_statements(curr_tx, curr_info, curr_divs, orig_tx, orig_info, orig_d
         unmatched_orig = list(o_data['transactions'])
         unmatched_curr = []
         
-        # Pass 1: Exact matches (Date, Type, AND Amount)
         for c_t in c_data['transactions']:
             exact_match = next((t for t in unmatched_orig if t['date'] == c_t['date'] and t['type'] == c_t['type'] and abs(t['amount']['val'] - c_t['amount']['val']) < 0.001), None)
             if exact_match:
@@ -463,7 +577,6 @@ def compare_statements(curr_tx, curr_info, curr_divs, orig_tx, orig_info, orig_d
             else:
                 unmatched_curr.append(c_t)
                 
-        # Pass 2: Recharacterization (Split/Merge) Detection (Match by Date and Total Sum)
         still_unmatched_curr = []
         orig_by_date = defaultdict(list)
         for t in unmatched_orig: orig_by_date[t['date']].append(t)
@@ -502,7 +615,6 @@ def compare_statements(curr_tx, curr_info, curr_divs, orig_tx, orig_info, orig_d
             else:
                 still_unmatched_curr.extend(c_txs)
                 
-        # Pass 3: Match by identity (Date and Type) for corrections where the sum ALSO changed
         unmatched_curr = still_unmatched_curr
         still_unmatched_curr = []
         
@@ -514,7 +626,6 @@ def compare_statements(curr_tx, curr_info, curr_divs, orig_tx, orig_info, orig_d
             else:
                 still_unmatched_curr.append(c_t)
                 
-        # Pass 4: Orphans (New or Removed)
         for c_t in still_unmatched_curr:
             msg = f"[NEW] Div Tx [{sec}] added: {c_t['date']} {c_t['type']} ${c_t['amount']['val']:.2f}"
             discrepancies.append(msg)
@@ -590,21 +701,25 @@ def compare_statements(curr_tx, curr_info, curr_divs, orig_tx, orig_info, orig_d
         })
         print(f"{c_red}{msg}{c_res}")
 
-    if discrepancies:
-        try:
-            with open(log_path, 'w', encoding='utf-8') as f:
+    try:
+        with open(log_path, 'w', encoding='utf-8') as f:
+            if discrepancies:
                 f.write("\n".join(discrepancies))
-            print(f"{COLOR_CYAN}Comparison text log saved to: {log_path}{COLOR_RESET}")
-            
-            csv_log_path = log_path.replace('.txt', '.csv')
-            with open(csv_log_path, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.DictWriter(f, fieldnames=['C_Flagged', 'Change_Type', 'Context', 'Original_Value', 'Current_Value'])
-                writer.writeheader()
-                writer.writerows(diffs_csv_rows)
-            print(f"{COLOR_CYAN}Comparison CSV log saved to: {csv_log_path}{COLOR_RESET}")
-        except IOError: pass
-    else:
+            else:
+                f.write("No value discrepancies found between statements.\n")
+        print(f"{COLOR_CYAN}Comparison text log saved to: {log_path}{COLOR_RESET}")
+        
+        csv_log_path = log_path.replace('.txt', '.csv')
+        with open(csv_log_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=['C_Flagged', 'Change_Type', 'Context', 'Original_Value', 'Current_Value'])
+            writer.writeheader()
+            writer.writerows(diffs_csv_rows)
+        print(f"{COLOR_CYAN}Comparison CSV log saved to: {csv_log_path}{COLOR_RESET}")
+    except IOError: pass
+    
+    if not discrepancies:
         print(f"{COLOR_GREEN}No value discrepancies found between statements.{COLOR_RESET}")
+        run_text_comparison(orig_pages, curr_pages, log_path, use_color)
 
 def prompt_for_missing_fed_pct(dividends_data, fed_csv_path, use_color=True):
     for sec_name, data in dividends_data.items():
@@ -766,22 +881,22 @@ def main():
                 print(f"{COLOR_RED}Error creating template: {e}{COLOR_RESET}")
             fed_csv_path = default_fed_csv 
     
-    orig_transactions, orig_summary, orig_dividends, orig_info = [], {}, {}, {}
+    orig_transactions, orig_summary, orig_dividends, orig_info, orig_pages = [], {}, {}, {}, {}
     if args.original:
         if not os.path.exists(args.original):
             print(f"{COLOR_RED}[!] ERROR: Original PDF '{args.original}' not found.{COLOR_RESET}")
             sys.exit(1)
-        orig_transactions, orig_summary, orig_dividends, orig_info = parse_statement(
+        orig_transactions, orig_summary, orig_dividends, orig_info, orig_pages = parse_statement(
             args.original, target_boxes, fed_csv_path=fed_csv_path, debug=False, use_color=use_color
         )
     
     print(f"{COLOR_CYAN}Parsing Document: {args.pdf}{COLOR_RESET}")
-    transactions, expected_summary, dividends_data, info_1099 = parse_statement(
+    transactions, expected_summary, dividends_data, info_1099, curr_pages = parse_statement(
         args.pdf, target_boxes, fed_csv_path=fed_csv_path, debug=args.debug, log_filepath=actual_log_file if args.debug else None, use_color=use_color
     )
 
     if args.original:
-        compare_statements(transactions, info_1099, dividends_data, orig_transactions, orig_info, orig_dividends, f"{prefix_str}comparison_log.txt", use_color)
+        compare_statements(transactions, info_1099, dividends_data, curr_pages, orig_transactions, orig_info, orig_dividends, orig_pages, f"{prefix_str}comparison_log.txt", use_color)
 
     prompt_for_missing_fed_pct(dividends_data, fed_csv_path, use_color=use_color)
 
