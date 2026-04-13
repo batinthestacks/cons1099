@@ -88,17 +88,11 @@ def get_clean_pdf_lines(pdf_path):
                 if not text: continue
                 
                 for line in text.split('\n'):
-                    # 1. Remove the specifically found statement date from everywhere in this file
                     if statement_date:
                         line = line.replace(statement_date, '')
                         
-                    # 2. Remove the optional CORRECTED string
                     line = re.sub(r'\bCORRECTED\b', '', line, flags=re.IGNORECASE)
-                    
-                    # 3. Remove Document ID dynamic values to prevent meaningless false diffs
                     line = re.sub(r'Document ID:\s*[A-Z0-9]+(?:\s+[A-Z0-9]+)*', 'Document ID:', line, flags=re.IGNORECASE)
-                    
-                    # 4. Collapse whitespace layout artifacts
                     line = re.sub(r'\s+', ' ', line)
                     stripped = line.strip()
                     
@@ -187,7 +181,6 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
     treasury_pattern = re.compile(r'U\.S\.\s*Treasury\s+([\d\.]+)')
     ny_pattern = re.compile(r'New York\s+([\d\.]+)')
     
-    # Vanguard dynamic endnote parser (e.g. "99 For the Vanguard settlement fund (9999100), the U.S government obligation percentage is 66.61%.")
     vanguard_note_pattern = re.compile(r'For the[^\(]{1,100}\(([A-Z0-9]+)\)[^%]{1,150}percentage is\s*([\d\.]+)%', re.IGNORECASE)
 
     current_global_box = None
@@ -466,6 +459,23 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
         if matched_sec:
             if supp['fed_pct'] is not None: dividends_data[matched_sec]['supplemental']['fed_pct'] = supp['fed_pct']
             if supp['ny_pct'] is not None: dividends_data[matched_sec]['supplemental']['ny_pct'] = supp['ny_pct']
+
+    # Auto-save dynamically discovered Fed percentages from the PDF to the CSV
+    if fed_csv_path and not is_comparison:
+        new_pcts_saved = 0
+        try:
+            with open(fed_csv_path, 'a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                for supp in supplemental_extracted:
+                    if supp.get('fed_pct') is not None and supp.get('cusip'):
+                        if supp['cusip'] not in fed_csv_data:
+                            writer.writerow([supp['cusip'], f"{supp['fed_pct'] * 100.0:.2f}"])
+                            fed_csv_data[supp['cusip']] = supp['fed_pct']
+                            new_pcts_saved += 1
+            if new_pcts_saved > 0:
+                cprint(f"    [+] Auto-saved {new_pcts_saved} newly discovered Fed percentage(s) to '{fed_csv_path}'", COLOR_GREEN)
+        except IOError as e:
+            cprint(f"    [!] Error auto-saving to {fed_csv_path}: {e}", COLOR_RED)
 
     if fed_csv_data:
         for k, v in dividends_data.items():
