@@ -27,7 +27,6 @@ def parse_val_and_c(val_str):
     val_str_upper = val_str.upper()
     has_c = 'C' in val_str_upper
     try:
-        # Strip everything except digits, decimals, and negative signs
         clean_str = re.sub(r'[^\d\.\-]', '', val_str)
         return float(clean_str), has_c
     except ValueError:
@@ -98,7 +97,6 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
         except Exception:
             pass
 
-    # Regexes updated to capture trailing C/c
     summary_row_pattern = re.compile(
         r'(B\s+or\s+E|C\s+or\s+F|A|B|C|D|E|F)\s*(?:\(basis.*?\)|\(Form.*?\))\s*'
         r'([\d,]+\.\d{2}\s*[cC]?)\s*([\d,]+\.\d{2}\s*[cC]?)\s*([\d,]+\.\d{2}\s*[cC]?)\s*([\d,]+\.\d{2}\s*[cC]?)\s*([-\d,]+\.\d{2}\s*[cC]?)', re.IGNORECASE
@@ -180,11 +178,16 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
 
                 for sum_match in summary_row_pattern.finditer(page_text):
                     box = re.sub(r'\s+', ' ', sum_match.group(1)).upper()
+                    p_val, p_c = parse_val_and_c(sum_match.group(2))
+                    cb_val, cb_c = parse_val_and_c(sum_match.group(3))
+                    adj_val, adj_c = parse_val_and_c(sum_match.group(4))
+                    gl_val, gl_c = parse_val_and_c(sum_match.group(6))
+                    
                     summary_expected[box] = {
-                        'proceeds': parse_val_and_c(sum_match.group(2)), 
-                        'cost_basis': parse_val_and_c(sum_match.group(3)),
-                        'adjustments': parse_val_and_c(sum_match.group(4)),
-                        'gain_loss': parse_val_and_c(sum_match.group(6))
+                        'proceeds': {'val': p_val, 'c': p_c},
+                        'cost_basis': {'val': cb_val, 'c': cb_c},
+                        'adjustments': {'val': adj_val, 'c': adj_c},
+                        'gain_loss': {'val': gl_val, 'c': gl_c}
                     }
 
                 box_headers = [{'box': m.group(1).upper(), 'start': m.start()} for m in re.finditer(r'Box\s+([A-F])\s+checked', page_text, re.IGNORECASE)]
@@ -233,12 +236,18 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
                         base_desc = re.sub(r'\s*/\s*Symbol:?\s*$', '', current_1099b_sec, flags=re.IGNORECASE).strip()
                         formatted_desc = f"{qty_str} {base_desc}"
                         
+                        adj_val, adj_c = parse_val_and_c(data['adj']) if data['adj'] else (0.0, False)
+                        
                         tx = {
-                            'box': box, 'description': formatted_desc, 'base_description': base_desc,
-                            'date_sold': data['dsold'], 'date_acquired': data['dacq'],
+                            'box': box, 
+                            'description': formatted_desc, 
+                            'base_description': base_desc,
+                            'date_sold': data['dsold'], 
+                            'date_acquired': data['dacq'],
                             'quantity': {'val': qty_val, 'c': qty_c},
                             'proceeds': {'val': parse_val_and_c(data['proceeds'])[0], 'c': parse_val_and_c(data['proceeds'])[1]},
                             'cost_basis': {'val': parse_val_and_c(data['basis'])[0], 'c': parse_val_and_c(data['basis'])[1]},
+                            'adjustments': {'val': adj_val, 'c': adj_c},
                             'gain_loss': {'val': parse_val_and_c(data['gl'])[0], 'c': parse_val_and_c(data['gl'])[1]}
                         }
                         transactions.append(tx)
@@ -391,7 +400,6 @@ def compare_statements(curr_tx, curr_info, curr_divs, orig_tx, orig_info, orig_d
     for sec, c_data in curr_divs.items():
         o_data = orig_divs.get(sec)
         if not o_data:
-            # Try matching by CUSIP if name changed slightly
             o_data = next((v for k, v in orig_divs.items() if v['cusip'] and v['cusip'] == c_data['cusip']), None)
         
         if not o_data:
@@ -403,21 +411,68 @@ def compare_statements(curr_tx, curr_info, curr_divs, orig_tx, orig_info, orig_d
             o_val = o_data['totals'].get(t_type, {'val': 0.0})['val']
             log_diff(f"Div Total [{sec}] '{t_type}'", o_val, c_tot['val'], c_tot['c'])
             
-        # Match transactions by date/type
+        # POOL MATCHING LOGIC FOR DIVIDENDS
+        unmatched_orig = list(o_data['transactions'])
+        unmatched_curr = []
+        
+        # Pass 1: Exact matches (Date, Type, AND Amount)
         for c_t in c_data['transactions']:
-            o_t = next((t for t in o_data['transactions'] if t['date'] == c_t['date'] and t['type'] == c_t['type']), None)
-            if o_t: log_diff(f"Div Tx [{sec}] ({c_t['date']} {c_t['type']})", o_t['amount']['val'], c_t['amount']['val'], c_t['amount']['c'])
-            else: discrepancies.append(f"[NEW] Div Tx [{sec}] added: {c_t['date']} {c_t['type']} {c_t['amount']['val']:.2f}")
+            exact_match = next((t for t in unmatched_orig if t['date'] == c_t['date'] and t['type'] == c_t['type'] and t['amount']['val'] == c_t['amount']['val']), None)
+            if exact_match:
+                unmatched_orig.remove(exact_match)
+            else:
+                unmatched_curr.append(c_t)
+                
+        # Pass 2: Match by identity (Date and Type) for corrections
+        for c_t in unmatched_curr:
+            identity_match = next((t for t in unmatched_orig if t['date'] == c_t['date'] and t['type'] == c_t['type']), None)
+            if identity_match:
+                unmatched_orig.remove(identity_match)
+                log_diff(f"Div Tx [{sec}] ({c_t['date']} {c_t['type']})", identity_match['amount']['val'], c_t['amount']['val'], c_t['amount']['c'])
+            else:
+                discrepancies.append(f"[NEW] Div Tx [{sec}] added: {c_t['date']} {c_t['type']} {c_t['amount']['val']:.2f}")
 
     # 3. Compare 1099-B Transactions
+    unmatched_orig_tx = list(orig_tx)
+    unmatched_curr_tx = []
+    
+    # Pass 1: Exact Matches (Box, Desc, Date, Qty, Proceeds, CB)
     for c_t in curr_tx:
-        o_t = next((t for t in orig_tx if t['box'] == c_t['box'] and t['base_description'] == c_t['base_description'] and t['date_sold'] == c_t['date_sold'] and t['quantity']['val'] == c_t['quantity']['val']), None)
-        if o_t:
-            ctx = f"1099-B Tx [{c_t['box']}] {c_t['base_description']} ({c_t['date_sold']})"
-            log_diff(f"{ctx} Proceeds", o_t['proceeds']['val'], c_t['proceeds']['val'], c_t['proceeds']['c'])
-            log_diff(f"{ctx} Cost Basis", o_t['cost_basis']['val'], c_t['cost_basis']['val'], c_t['cost_basis']['c'])
-            log_diff(f"{ctx} Gain/Loss", o_t['gain_loss']['val'], c_t['gain_loss']['val'], c_t['gain_loss']['c'])
+        exact = next((t for t in unmatched_orig_tx if 
+            t['box'] == c_t['box'] and 
+            t['base_description'] == c_t['base_description'] and 
+            t['date_sold'] == c_t['date_sold'] and 
+            t['quantity']['val'] == c_t['quantity']['val'] and
+            t['proceeds']['val'] == c_t['proceeds']['val'] and
+            t['cost_basis']['val'] == c_t['cost_basis']['val']
+        ), None)
+        if exact:
+            unmatched_orig_tx.remove(exact)
+        else:
+            unmatched_curr_tx.append(c_t)
             
+    # Pass 2: Match by identity (Box, Desc, Date, Qty) for corrections
+    for c_t in unmatched_curr_tx:
+        identity_match = next((t for t in unmatched_orig_tx if 
+            t['box'] == c_t['box'] and 
+            t['base_description'] == c_t['base_description'] and 
+            t['date_sold'] == c_t['date_sold'] and 
+            t['quantity']['val'] == c_t['quantity']['val']
+        ), None)
+        
+        if identity_match:
+            unmatched_orig_tx.remove(identity_match)
+            ctx = f"1099-B Tx [{c_t['box']}] {c_t['base_description']} ({c_t['date_sold']})"
+            log_diff(f"{ctx} Proceeds", identity_match['proceeds']['val'], c_t['proceeds']['val'], c_t['proceeds']['c'])
+            log_diff(f"{ctx} Cost Basis", identity_match['cost_basis']['val'], c_t['cost_basis']['val'], c_t['cost_basis']['c'])
+            log_diff(f"{ctx} Adjustments", identity_match['adjustments']['val'], c_t['adjustments']['val'], c_t['adjustments']['c'])
+            log_diff(f"{ctx} Gain/Loss", identity_match['gain_loss']['val'], c_t['gain_loss']['val'], c_t['gain_loss']['c'])
+        else:
+            discrepancies.append(f"[NEW] 1099-B Tx added: [{c_t['box']}] {c_t['base_description']} ({c_t['date_sold']}) Qty: {c_t['quantity']['val']:.4f}")
+            
+    for o_t in unmatched_orig_tx:
+        discrepancies.append(f"[REMOVED] 1099-B Tx removed: [{o_t['box']}] {o_t['base_description']} ({o_t['date_sold']}) Qty: {o_t['quantity']['val']:.4f}")
+
     if discrepancies:
         try:
             with open(log_path, 'w', encoding='utf-8') as f:
@@ -518,6 +573,33 @@ def write_supplemental_csvs(dividends_data, prefix_str):
                 print(f"Created: {filename} ({len(rows)} securities)")
             except IOError as e: print(f"Error writing {filename}: {e}")
 
+def cross_check(transactions, expected_summary, use_color=True):
+    print("\n--- Cross-Check vs 1099-B Statement Summary ---")
+    calculated = defaultdict(lambda: {'proceeds': 0.0, 'cost_basis': 0.0, 'adjustments': 0.0, 'gain_loss': 0.0})
+    for tx in transactions:
+        b = tx['box']
+        calculated[b]['proceeds'] += tx['proceeds']['val']
+        calculated[b]['cost_basis'] += tx['cost_basis']['val']
+        calculated[b]['adjustments'] += tx['adjustments']['val']
+        calculated[b]['gain_loss'] += tx['gain_loss']['val']
+        
+    all_match = True
+    for box in [box for box in expected_summary.keys() if box in ['A', 'B', 'C', 'D', 'E', 'F']]:
+        expected = expected_summary[box]
+        calc = calculated[box]
+        print(f"\nBox {box}:")
+        for field in ['proceeds', 'cost_basis', 'adjustments', 'gain_loss']:
+            diff = abs(expected[field]['val'] - calc[field])
+            if diff < 0.02: status = f"{COLOR_GREEN}MATCH{COLOR_RESET}" if use_color else "MATCH"
+            else:
+                status = f"{COLOR_RED}MISMATCH (diff: {diff:.2f}){COLOR_RESET}" if use_color else f"MISMATCH (diff: {diff:.2f})"
+                all_match = False
+            print(f"  {field.capitalize():<12} | Expected: {expected[field]['val']:>10.2f} | Parsed: {calc[field]:>10.2f} | {status}")
+            
+    print("\n-------------------------------------------------")
+    if all_match: print(f"{COLOR_GREEN}SUCCESS: All parsed 1099-B totals match the statement summary.{COLOR_RESET}" if use_color else "SUCCESS: All parsed 1099-B totals match the statement summary.")
+    else: print(f"{COLOR_RED}WARNING: 1099-B Cross-check failed! Parsed data does not match summary.{COLOR_RESET}" if use_color else "WARNING: 1099-B Cross-check failed! Parsed data does not match summary.")
+
 def main():
     parser = argparse.ArgumentParser(description="Parse Brokerage 1099-B and Dividend statements.")
     parser.add_argument("pdf", help="Path to the current 1099 PDF file.")
@@ -560,7 +642,6 @@ def main():
                 print(f"{COLOR_RED}Error creating template: {e}{COLOR_RESET}")
             fed_csv_path = default_fed_csv 
     
-    # 1. Parse Original Statement (if provided)
     orig_transactions, orig_summary, orig_dividends, orig_info = [], {}, {}, {}
     if args.original:
         if not os.path.exists(args.original):
@@ -570,12 +651,11 @@ def main():
             args.original, target_boxes, fed_csv_path=fed_csv_path, debug=False, use_color=use_color
         )
     
-    # 2. Parse Current Statement
+    print(f"{COLOR_CYAN}Parsing Document: {args.pdf}{COLOR_RESET}")
     transactions, expected_summary, dividends_data, info_1099 = parse_statement(
         args.pdf, target_boxes, fed_csv_path=fed_csv_path, debug=args.debug, log_filepath=actual_log_file if args.debug else None, use_color=use_color
     )
 
-    # 3. Compare Statements
     if args.original:
         compare_statements(transactions, info_1099, dividends_data, orig_transactions, orig_info, orig_dividends, f"{prefix_str}comparison_log.txt", use_color)
 
@@ -589,7 +669,6 @@ def main():
                 writer.writerow({k: (tx[k]['val'] if isinstance(tx[k], dict) else tx[k]) for k in ['box', 'description', 'date_sold', 'quantity', 'proceeds', 'date_acquired', 'cost_basis', 'adjustments', 'gain_loss']})
         print(f"Created: {actual_output_file} ({len(transactions)} 1099-B transactions)")
         
-        # 1099-B Summary CSV Generation
         summary_1099b = defaultdict(lambda: {
             'date_sold_set': set(), 'date_acquired_set': set(), 'base_desc_set': set(),
             'quantity': 0.0, 'proceeds': 0.0, 'cost_basis': 0.0, 'adjustments': 0.0, 'gain_loss': 0.0
@@ -630,6 +709,8 @@ def main():
             print(f"    [+] Created: {summary_file} ({len(summary_1099b)} box summaries)")
         except IOError as e:
             print(f"Error writing {summary_file}: {e}")
+            
+        cross_check(transactions, expected_summary, use_color=use_color)
             
     else: print(f"{COLOR_YELLOW}No 1099-B transactions found.{COLOR_RESET}")
 
