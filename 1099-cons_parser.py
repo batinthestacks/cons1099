@@ -540,12 +540,31 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
 def print_single_summary_grid(info_1099, correction_flags, statement_date, use_color=True):
     c_c, c_res = (COLOR_CYAN, COLOR_RESET) if use_color else ("", "")
     print(f"\n{c_c}[1099-DIV Summary Boxes]{c_res}")
-    print("C_Flagged\tBox\tValue")
-    fields = {'1a': '1a- Total ordinary dividends', '1b': '1b- Qualified dividends', '2a': '2a- Total capital gain', '2b': '2b- Unrecaptured Section 1250', '3': '3- Nondividend distributions', '5': '5- Section 199A', '12': '12- Exempt-interest dividends'}
+    
+    fields = {
+        '1a': '1a- Total ordinary dividends',
+        '1b': '1b- Qualified dividends',
+        '2a': '2a- Total capital gain',
+        '2b': '2b- Unrecaptured Section 1250',
+        '3':  ' 3- Nondividend distributions',
+        '5':  ' 5- Section 199A',
+        '12': '12- Exempt-interest dividends'
+    }
+    
+    h_flag = f"{'C_Flagged':<9}"
+    h_box = f"{'Box':<30}"
+    h_val = f"{'Value':<12}"
+    
+    print(f"{h_flag}\t{h_box}\t{h_val}")
+    
+    total_val = 0.0
     for k, label in fields.items():
         if info_1099[k] != 0.0:
             is_flagged = "Yes" if correction_flags['info_1099'].get(k, False) else "No"
-            print(f"{is_flagged}\t{label}\t{info_1099[k]:.2f}")
+            print(f"{is_flagged:>9}\t{label:<30}\t{info_1099[k]:>12.2f}")
+            total_val += info_1099[k]
+            
+    print(f"{'':>9}\t{'Total dividend line':<30}\t{total_val:>12.2f}")
 
 def print_corrected_items(correction_flags, transactions, dividends_data, use_color=True):
     c_y, c_res = (COLOR_YELLOW, COLOR_RESET) if use_color else ("", "")
@@ -620,17 +639,41 @@ def compare_statements(p_info, p_divs, p_tx, c_info, c_divs, c_tx, p_path, c_pat
         cmp_print(msg)
         diff_log.append({"section": section, "description": desc, "previous": old_val, "current": new_val, "C_Flagged": c_flagged})
 
-    # 1. Summary Compare (Spreadsheet Ready Tab-Separated Grid)
+    # 1. Summary Compare (Spreadsheet Ready Grid)
     cmp_print("\n[1099-DIV Summary Boxes]")
-    cmp_print(f"C_Flagged\tBox\t{p_date}\t{c_date}")
-    fields = {'1a': '1a- Total ordinary dividends', '1b': '1b- Qualified dividends', '2a': '2a- Total capital gain', '2b': '2b- Unrecaptured Section 1250', '3': '3- Nondividend distributions', '5': '5- Section 199A', '12': '12- Exempt-interest dividends'}
+    
+    fields = {
+        '1a': '1a- Total ordinary dividends',
+        '1b': '1b- Qualified dividends',
+        '2a': '2a- Total capital gain',
+        '2b': '2b- Unrecaptured Section 1250',
+        '3':  ' 3- Nondividend distributions',
+        '5':  ' 5- Section 199A',
+        '12': '12- Exempt-interest dividends'
+    }
+    
+    h_flag = f"{'C_Flagged':<9}"
+    h_box = f"{'Box':<30}"
+    h_d1 = f"{p_date:<12}"
+    h_d2 = f"{c_date:<12}"
+    
+    cmp_print(f"{h_flag}\t{h_box}\t{h_d1}\t{h_d2}")
+    
+    total_p = 0.0
+    total_c = 0.0
     
     for k, label in fields.items():
         if p_info[k] != 0.0 or c_info[k] != 0.0:
             is_flagged = "Yes" if correction_flags['info_1099'].get(k, False) else "No"
-            cmp_print(f"{is_flagged}\t{label}\t{p_info[k]:.2f}\t{c_info[k]:.2f}")
+            cmp_print(f"{is_flagged:>9}\t{label:<30}\t{p_info[k]:>12.2f}\t{c_info[k]:>12.2f}")
+            
+            total_p += p_info[k]
+            total_c += c_info[k]
+            
             if p_info[k] != c_info[k]:
                 diff_log.append({"section": "1099-DIV Summary", "description": label, "previous": p_info[k], "current": c_info[k], "C_Flagged": is_flagged})
+
+    cmp_print(f"{'':>9}\t{'Total dividend line':<30}\t{total_p:>12.2f}\t{total_c:>12.2f}")
 
     # 2. Grand Totals Compare
     cmp_print("\n[Document Grand Totals]")
