@@ -918,23 +918,40 @@ def write_category_totals_csv(filename, dividends_data, target_key):
 
 def write_supplemental_csvs(dividends_data, prefix_str, threshold=0.0):
     fed_rows = []
+    fed_under_rows = []
+    
     for k, v in dividends_data.items():
         tot_div = v['totals'].get("Total Dividends & distributions", 0.0)
         fed_pct = v['supplemental'].get("fed_pct")
-        if tot_div > 0 and fed_pct is not None and (fed_pct * 100) >= threshold:
+        if tot_div > 0 and fed_pct is not None:
             calc_div = tot_div * fed_pct
-            fed_rows.append({'Security Name': k, 'CUSIP': v['cusip'], 'Total Amount': f"{tot_div:.2f}", 'Percentage': f"{fed_pct*100:.2f}%", 'Calculated': f"{calc_div:.2f}"})
-            
-    if fed_rows:
-        filename = f"{prefix_str}us_securities_state_exempt_box20.csv"
-        try:
-            with open(filename, mode='w', newline='', encoding='utf-8') as f:
-                w = csv.DictWriter(f, fieldnames=['Security Name', 'CUSIP', 'Total Amount', 'Percentage', 'Calculated'])
-                w.writeheader()
-                w.writerows(fed_rows)
-                w.writerow({'Security Name': 'OVERALL TOTAL', 'CUSIP': '', 'Total Amount': f"{sum(float(r['Total Amount']) for r in fed_rows):.2f}", 'Percentage': '', 'Calculated': f"{sum(float(r['Calculated']) for r in fed_rows):.2f}"})
-            print(f"    [+] Created: {filename} ({len(fed_rows)} securities, >= {threshold}% threshold applied)")
-        except IOError as e: print(f"Error writing {filename}: {e}")
+            row = {'Security Name': k, 'CUSIP': v['cusip'], 'Total Amount': f"{tot_div:.2f}", 'Percentage': f"{fed_pct*100:.2f}%", 'Calculated': f"{calc_div:.2f}"}
+            if (fed_pct * 100) >= threshold:
+                fed_rows.append(row)
+            else:
+                fed_under_rows.append(row)
+                
+    # Over Threshold Box 20 CSV
+    filename_over = f"{prefix_str}us_securities_state_exempt_box20.csv"
+    try:
+        with open(filename_over, mode='w', newline='', encoding='utf-8') as f:
+            w = csv.DictWriter(f, fieldnames=['Security Name', 'CUSIP', 'Total Amount', 'Percentage', 'Calculated'])
+            w.writeheader()
+            w.writerows(fed_rows)
+            w.writerow({'Security Name': 'OVERALL TOTAL', 'CUSIP': '', 'Total Amount': f"{sum(float(r['Total Amount']) for r in fed_rows):.2f}", 'Percentage': '', 'Calculated': f"{sum(float(r['Calculated']) for r in fed_rows):.2f}"})
+        print(f"    [+] Created: {filename_over} ({len(fed_rows)} securities, >= {threshold}% threshold applied)")
+    except IOError as e: print(f"Error writing {filename_over}: {e}")
+
+    # Under Threshold Box 20 CSV
+    filename_under = f"{prefix_str}us_securities_state_exempt_box20_under_threshold.csv"
+    try:
+        with open(filename_under, mode='w', newline='', encoding='utf-8') as f:
+            w = csv.DictWriter(f, fieldnames=['Security Name', 'CUSIP', 'Total Amount', 'Percentage', 'Calculated'])
+            w.writeheader()
+            w.writerows(fed_under_rows)
+            w.writerow({'Security Name': 'OVERALL TOTAL', 'CUSIP': '', 'Total Amount': f"{sum(float(r['Total Amount']) for r in fed_under_rows):.2f}", 'Percentage': '', 'Calculated': f"{sum(float(r['Calculated']) for r in fed_under_rows):.2f}"})
+        print(f"    [+] Created: {filename_under} ({len(fed_under_rows)} securities, < {threshold}% threshold applied)")
+    except IOError as e: print(f"Error writing {filename_under}: {e}")
 
     ny_rows = []
     for k, v in dividends_data.items():
