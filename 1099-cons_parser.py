@@ -562,7 +562,8 @@ def print_single_summary_grid(info_1099, correction_flags, statement_date, use_c
         if info_1099[k] != 0.0:
             is_flagged = "Yes" if correction_flags['info_1099'].get(k, False) else "No"
             print(f"{is_flagged:>9}\t{label:<30}\t{info_1099[k]:>12.2f}")
-            total_val += info_1099[k]
+            if k in ['1a', '2a', '3', '12']:
+                total_val += info_1099[k]
             
     print(f"{'':>9}\t{'Total dividend line':<30}\t{total_val:>12.2f}")
 
@@ -667,8 +668,9 @@ def compare_statements(p_info, p_divs, p_tx, c_info, c_divs, c_tx, p_path, c_pat
             is_flagged = "Yes" if correction_flags['info_1099'].get(k, False) else "No"
             cmp_print(f"{is_flagged:>9}\t{label:<30}\t{p_info[k]:>12.2f}\t{c_info[k]:>12.2f}")
             
-            total_p += p_info[k]
-            total_c += c_info[k]
+            if k in ['1a', '2a', '3', '12']:
+                total_p += p_info[k]
+                total_c += c_info[k]
             
             if p_info[k] != c_info[k]:
                 diff_log.append({"section": "1099-DIV Summary", "description": label, "previous": p_info[k], "current": c_info[k], "C_Flagged": is_flagged})
