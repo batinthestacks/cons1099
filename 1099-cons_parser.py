@@ -565,7 +565,7 @@ def print_single_summary_grid(info_1099, correction_flags, statement_date, use_c
             if k in ['1a', '2a', '3', '12']:
                 total_val += info_1099[k]
             
-    print(f"{'':>9}\t{'Total dividend line':<30}\t{total_val:>12.2f}")
+    print(f"{'':>9}\t{'Total Dividends (1a,2a,3,12)':<30}\t{total_val:>12.2f}")
 
 def print_corrected_items(correction_flags, transactions, dividends_data, use_color=True):
     c_y, c_res = (COLOR_YELLOW, COLOR_RESET) if use_color else ("", "")
@@ -692,7 +692,7 @@ def compare_statements(p_info, p_divs, p_tx, c_info, c_divs, c_tx, p_path, c_pat
     elif total_diff < 0: tot_diff_str = f"{c_r}{tot_diff_padded}{c_res}"
     else: tot_diff_str = tot_diff_padded
 
-    cmp_print(f"{'':>9}\t{'Total dividend line':<30}\t{total_p:>12.2f}\t{total_c:>12.2f}\t{tot_diff_str}")
+    cmp_print(f"{'':>9}\t{'Total Dividends (1a,2a,3,12)':<30}\t{total_p:>12.2f}\t{total_c:>12.2f}\t{tot_diff_str}")
 
     # 2. Grand Totals Compare
     cmp_print("\n[Document Grand Totals]")
