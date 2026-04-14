@@ -88,11 +88,17 @@ def get_clean_pdf_lines(pdf_path):
                 if not text: continue
                 
                 for line in text.split('\n'):
+                    # 1. Remove the specifically found statement date from everywhere in this file
                     if statement_date:
                         line = line.replace(statement_date, '')
                         
+                    # 2. Remove the optional CORRECTED string
                     line = re.sub(r'\bCORRECTED\b', '', line, flags=re.IGNORECASE)
+                    
+                    # 3. Remove Document ID dynamic values to prevent meaningless false diffs
                     line = re.sub(r'Document ID:\s*[A-Z0-9]+(?:\s+[A-Z0-9]+)*', 'Document ID:', line, flags=re.IGNORECASE)
+                    
+                    # 4. Collapse whitespace layout artifacts
                     line = re.sub(r'\s+', ' ', line)
                     stripped = line.strip()
                     
@@ -440,6 +446,34 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
     except FileNotFoundError:
         print(f"Error: Could not find file {pdf_path}")
         sys.exit(1)
+
+    # --- Missing Totals Fallback (For single-transaction securities omitting a total line) ---
+    for sec_id, data in working_div_data.items():
+        if data['transactions'] and not data['totals']:
+            if len(data['transactions']) == 1:
+                tx = data['transactions'][0]
+                t_type = tx['type'].lower()
+                if 'exempt' in t_type:
+                    data['totals']['Total Tax-exempt dividends'] = tx['amount']
+                elif 'foreign' in t_type:
+                    data['totals']['Total Foreign tax withheld'] = tx['amount']
+                else:
+                    data['totals']['Total Dividends & distributions'] = tx['amount']
+            else:
+                div_total, exempt_total, foreign_total = 0.0, 0.0, 0.0
+                for tx in data['transactions']:
+                    t_type = tx['type'].lower()
+                    if 'exempt' in t_type:
+                        exempt_total += tx['amount']
+                    elif 'foreign' in t_type:
+                        foreign_total += tx['amount']
+                    elif '199a' not in t_type: # Skip subsets to avoid double counting
+                        div_total += tx['amount']
+                
+                if exempt_total > 0: data['totals']['Total Tax-exempt dividends'] = exempt_total
+                if foreign_total > 0: data['totals']['Total Foreign tax withheld'] = foreign_total
+                if div_total > 0: data['totals']['Total Dividends & distributions'] = div_total
+    # ------------------------------------------------------------------------------------------
 
     dividends_data = defaultdict(lambda: {'cusip': '', 'transactions': [], 'totals': defaultdict(float), 'supplemental': {}})
     for sec_id, data in working_div_data.items():
