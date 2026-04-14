@@ -111,6 +111,7 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
     transactions = []
     summary_expected = {}
     supplemental_extracted = []
+    statement_date = "Unknown Date"
     
     info_1099 = {
         '1a': 0.0, '1b': 0.0, '2a': 0.0, '2b': 0.0, '3': 0.0, '5': 0.0, '12': 0.0,
@@ -218,6 +219,11 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
                 
                 if not page_text: continue
                 if debug: debug_log["raw_pages"][f"page_{page_num + 1}"] = page_text
+                
+                if "Statement Date:" in page_text:
+                    date_match = re.search(r'Statement Date:\s*(\d{2}/\d{2}/\d{4})', page_text, re.IGNORECASE)
+                    if date_match and statement_date == "Unknown Date":
+                        statement_date = date_match.group(1)
                 
                 # Active scan for Vanguard Endnotes anywhere on the page
                 flat_text = re.sub(r'\s+', ' ', page_text)
@@ -529,7 +535,17 @@ def parse_statement(pdf_path, target_boxes, fed_csv_path=None, debug=False, log_
                 with open(log_filepath, 'w', encoding='utf-8') as f: json.dump(debug_log, f, indent=2)
             except IOError as e: cprint(f"[!] Error writing debug JSON log: {e}", COLOR_RED)
 
-    return transactions, summary_expected, dividends_data, info_1099, correction_flags
+    return transactions, summary_expected, dividends_data, info_1099, correction_flags, statement_date
+
+def print_single_summary_grid(info_1099, correction_flags, statement_date, use_color=True):
+    c_c, c_res = (COLOR_CYAN, COLOR_RESET) if use_color else ("", "")
+    print(f"\n{c_c}[1099-DIV Summary Boxes]{c_res}")
+    print("C_Flagged\tBox\tValue")
+    fields = {'1a': '1a- Total ordinary dividends', '1b': '1b- Qualified dividends', '2a': '2a- Total capital gain', '2b': '2b- Unrecaptured Section 1250', '3': '3- Nondividend distributions', '5': '5- Section 199A', '12': '12- Exempt-interest dividends'}
+    for k, label in fields.items():
+        if info_1099[k] != 0.0:
+            is_flagged = "Yes" if correction_flags['info_1099'].get(k, False) else "No"
+            print(f"{is_flagged}\t{label}\t{info_1099[k]:.2f}")
 
 def print_corrected_items(correction_flags, transactions, dividends_data, use_color=True):
     c_y, c_res = (COLOR_YELLOW, COLOR_RESET) if use_color else ("", "")
@@ -583,7 +599,7 @@ def print_corrected_items(correction_flags, transactions, dividends_data, use_co
     if not found_any:
         print("  No correction markers found.")
 
-def compare_statements(p_info, p_divs, p_tx, c_info, c_divs, c_tx, p_path, c_path, prefix_str, correction_flags, log_filepath=None, use_color=True):
+def compare_statements(p_info, p_divs, p_tx, c_info, c_divs, c_tx, p_path, c_path, prefix_str, correction_flags, p_date, c_date, log_filepath=None, use_color=True):
     c_c, c_y, c_g, c_r, c_res = (COLOR_CYAN, COLOR_YELLOW, COLOR_GREEN, COLOR_RED, COLOR_RESET) if use_color else ("", "", "", "", "")
     
     txt_log_path = f"{prefix_str}comparison.txt"
@@ -604,16 +620,17 @@ def compare_statements(p_info, p_divs, p_tx, c_info, c_divs, c_tx, p_path, c_pat
         cmp_print(msg)
         diff_log.append({"section": section, "description": desc, "previous": old_val, "current": new_val, "C_Flagged": c_flagged})
 
-    # 1. Summary Compare
+    # 1. Summary Compare (Spreadsheet Ready Tab-Separated Grid)
     cmp_print("\n[1099-DIV Summary Boxes]")
+    cmp_print(f"C_Flagged\tBox\t{p_date}\t{c_date}")
     fields = {'1a': '1a- Total ordinary dividends', '1b': '1b- Qualified dividends', '2a': '2a- Total capital gain', '2b': '2b- Unrecaptured Section 1250', '3': '3- Nondividend distributions', '5': '5- Section 199A', '12': '12- Exempt-interest dividends'}
-    has_summ_diff = False
+    
     for k, label in fields.items():
-        if p_info[k] != c_info[k]:
+        if p_info[k] != 0.0 or c_info[k] != 0.0:
             is_flagged = "Yes" if correction_flags['info_1099'].get(k, False) else "No"
-            log_diff("1099-DIV Summary", label, p_info[k], c_info[k], is_flagged)
-            has_summ_diff = True
-    if not has_summ_diff: cmp_print("  No changes.")
+            cmp_print(f"{is_flagged}\t{label}\t{p_info[k]:.2f}\t{c_info[k]:.2f}")
+            if p_info[k] != c_info[k]:
+                diff_log.append({"section": "1099-DIV Summary", "description": label, "previous": p_info[k], "current": c_info[k], "C_Flagged": is_flagged})
 
     # 2. Grand Totals Compare
     cmp_print("\n[Document Grand Totals]")
@@ -955,7 +972,7 @@ def main():
     # ---------------------------------------------------------
     # COMPARISON RUN BYPASS: This block strictly isolated.
     # ---------------------------------------------------------
-    prev_info, prev_divs, prev_tx = None, None, None
+    prev_info, prev_divs, prev_tx, prev_date = None, None, None, None
     if args.original:
         if not os.path.exists(args.original):
             print(f"{COLOR_RED}[!] ERROR: Original file '{args.original}' does not exist.{COLOR_RESET}")
@@ -964,12 +981,12 @@ def main():
             sys.exit(1)
             
         print(f"\n{COLOR_YELLOW}=== PARSING ORIGINAL STATEMENT FOR COMPARISON ==={COLOR_RESET}" if use_color else "\n=== PARSING ORIGINAL STATEMENT FOR COMPARISON ===")
-        prev_tx, _, prev_divs, prev_info, _ = parse_statement(
+        prev_tx, _, prev_divs, prev_info, _, prev_date = parse_statement(
             args.original, target_boxes, fed_csv_path=fed_csv_path, debug=False, log_filepath=None, use_color=use_color, is_comparison=True
         )
     # ---------------------------------------------------------
     
-    transactions, expected_summary, dividends_data, info_1099, c_flags = parse_statement(
+    transactions, expected_summary, dividends_data, info_1099, c_flags, curr_date = parse_statement(
         args.pdf, target_boxes, fed_csv_path=fed_csv_path, debug=args.debug, log_filepath=actual_log_file if args.debug else None, use_color=use_color
     )
 
@@ -977,7 +994,9 @@ def main():
     
     # Strictly isolated doc comparison block
     if args.original:
-        compare_statements(prev_info, prev_divs, prev_tx, info_1099, dividends_data, transactions, p_path=args.original, c_path=args.pdf, prefix_str=prefix_str, correction_flags=c_flags, log_filepath=actual_log_file if args.debug else None, use_color=use_color)
+        compare_statements(prev_info, prev_divs, prev_tx, info_1099, dividends_data, transactions, p_path=args.original, c_path=args.pdf, prefix_str=prefix_str, correction_flags=c_flags, p_date=prev_date, c_date=curr_date, log_filepath=actual_log_file if args.debug else None, use_color=use_color)
+    else:
+        print_single_summary_grid(info_1099, c_flags, curr_date, use_color=use_color)
 
     prompt_for_missing_fed_pct(dividends_data, fed_csv_path, use_color=use_color)
 
