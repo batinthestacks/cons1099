@@ -657,8 +657,9 @@ def compare_statements(p_info, p_divs, p_tx, c_info, c_divs, c_tx, p_path, c_pat
     h_box = f"{'Box':<30}"
     h_d1 = f"{p_date:<12}"
     h_d2 = f"{c_date:<12}"
+    h_diff = f"{'Difference':<12}"
     
-    cmp_print(f"{h_flag}\t{h_box}\t{h_d1}\t{h_d2}")
+    cmp_print(f"{h_flag}\t{h_box}\t{h_d1}\t{h_d2}\t{h_diff}")
     
     total_p = 0.0
     total_c = 0.0
@@ -666,7 +667,16 @@ def compare_statements(p_info, p_divs, p_tx, c_info, c_divs, c_tx, p_path, c_pat
     for k, label in fields.items():
         if p_info[k] != 0.0 or c_info[k] != 0.0:
             is_flagged = "Yes" if correction_flags['info_1099'].get(k, False) else "No"
-            cmp_print(f"{is_flagged:>9}\t{label:<30}\t{p_info[k]:>12.2f}\t{c_info[k]:>12.2f}")
+            
+            diff_val = c_info[k] - p_info[k]
+            if abs(diff_val) < 0.005: diff_val = 0.0
+            
+            diff_str_padded = f"{diff_val:>12.2f}"
+            if diff_val > 0: diff_str = f"{c_g}{diff_str_padded}{c_res}"
+            elif diff_val < 0: diff_str = f"{c_r}{diff_str_padded}{c_res}"
+            else: diff_str = diff_str_padded
+            
+            cmp_print(f"{is_flagged:>9}\t{label:<30}\t{p_info[k]:>12.2f}\t{c_info[k]:>12.2f}\t{diff_str}")
             
             if k in ['1a', '2a', '3', '12']:
                 total_p += p_info[k]
@@ -675,7 +685,14 @@ def compare_statements(p_info, p_divs, p_tx, c_info, c_divs, c_tx, p_path, c_pat
             if p_info[k] != c_info[k]:
                 diff_log.append({"section": "1099-DIV Summary", "description": label, "previous": p_info[k], "current": c_info[k], "C_Flagged": is_flagged})
 
-    cmp_print(f"{'':>9}\t{'Total dividend line':<30}\t{total_p:>12.2f}\t{total_c:>12.2f}")
+    total_diff = total_c - total_p
+    if abs(total_diff) < 0.005: total_diff = 0.0
+    tot_diff_padded = f"{total_diff:>12.2f}"
+    if total_diff > 0: tot_diff_str = f"{c_g}{tot_diff_padded}{c_res}"
+    elif total_diff < 0: tot_diff_str = f"{c_r}{tot_diff_padded}{c_res}"
+    else: tot_diff_str = tot_diff_padded
+
+    cmp_print(f"{'':>9}\t{'Total dividend line':<30}\t{total_p:>12.2f}\t{total_c:>12.2f}\t{tot_diff_str}")
 
     # 2. Grand Totals Compare
     cmp_print("\n[Document Grand Totals]")
